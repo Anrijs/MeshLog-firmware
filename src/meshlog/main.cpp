@@ -67,7 +67,8 @@
 #define TELEMETRY_MAX_RULES 16
 #define TELEMETRY_DEFAULT_RETRIES 3
 #define TELEMETRY_RETRY_INTERVAL 30000 //ms
-#define TELEMETRY_MIN_INTERVAL 10800 //s, 3h
+
+#define CONFIG_MIN_SELFREPORT_INTERVAL 120 // 2 minutes
 
 #include <helpers/BaseChatMesh.h>
 
@@ -1440,6 +1441,9 @@ public:
         if (_logp.version == 0) {
           _logp.version = 1;
           _logp.selfreport = 15 * 60; // 15 min default
+          if (_logp.selfreport != 0 && _logp.selfreport < CONFIG_MIN_SELFREPORT_INTERVAL) {
+            _logp.selfreport = CONFIG_MIN_SELFREPORT_INTERVAL;
+          }
           saveLogPrefs();
         }
 
@@ -1863,6 +1867,9 @@ public:
         Serial.println("  OK");
       } else if (memcmp(config, "report ", 7) == 0) {
         _logp.selfreport = atoi(&config[7]);
+        if (_logp.selfreport != 0 && _logp.selfreport < CONFIG_MIN_SELFREPORT_INTERVAL) {
+            _logp.selfreport = CONFIG_MIN_SELFREPORT_INTERVAL;
+          }
         saveLogPrefs();
         Serial.println("  OK");
       } else if (memcmp(config, "raw ", 4) == 0) {
