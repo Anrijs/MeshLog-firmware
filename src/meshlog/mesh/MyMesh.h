@@ -1,0 +1,2159 @@
+#pragma once
+
+#include <Arduino.h>
+#include <Mesh.h>
+
+#include <queue>
+#include <SPIFFS.h>
+#include <RTClib.h>
+#include <target.h>
+#include <helpers/BaseChatMesh.h>
+#include <helpers/IdentityStore.h>
+#include <helpers/StaticPoolPacketManager.h>
+#include <helpers/ArduinoHelpers.h>
+
+#include "NodePrefs.h"
+#include "LoggerMeshTables.h"
+#include "../utils.h"
+#include "../version.h"
+
+
+#define TELEMETRY_VERSION 1
+#define TELEMETRY_MAX_RULES 16
+#define TELEMETRY_DEFAULT_RETRIES 3
+#define TELEMETRY_RETRY_INTERVAL 30000 //ms
+#define TELEMETRY_MIN_INTERVAL 10800 // 3 hours
+
+#define MAX_LOG_QUEUE_SIZE  32
+
+#define CONFIG_MIN_SELFREPORT_INTERVAL 120 // 2 minutes
+
+#define SEND_TIMEOUT_BASE_MILLIS          500
+#define FLOOD_SEND_TIMEOUT_FACTOR         16.0f
+#define DIRECT_SEND_PERHOP_FACTOR         6.0f
+#define DIRECT_SEND_PERHOP_EXTRA_MILLIS   250
+
+#define  PUBLIC_GROUP_PSK "izOH6cXN6mrJ5e26oRXNcg=="
+#define REQ_TYPE_GET_TELEMETRY_DATA     0x03
+
+#ifdef WEBSERVER_ENABLE
+extern AsyncWebSocket ws; 
+#endif
+
+struct {
+  SemaphoreHandle_t mutex = xSemaphoreCreateMutex();
+  std::queue<String> queue;
+  unsigned discarded;
+
+  void push(const String& str) {
+      xSemaphoreTake(mutex, portMAX_DELAY);
+      while (queue.size() >= MAX_LOG_QUEUE_SIZE) {
+      discarded++;
+          Serial.printf("Discarded message (%u) %s\n", discarded, queue.front().c_str());
+      queue.pop();
+    }
+      queue.push(str);
+      xSemaphoreGive(mutex);
+  }
+
+  void push(const JsonDocument& doc) {
+    String postData;
+    serializeJson(doc, postData);
+    push(postData);
+  }
+
+  size_t size() { 
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    size_t s = queue.size(); 
+    xSemaphoreGive(mutex);
+    return s;
+  }
+  String front() {
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    String val = queue.empty() ? String() : queue.front();
+    xSemaphoreGive(mutex);
+    return val;
+  }
+  void pop() {
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    if (!queue.empty()) {
+      queue.pop();
+    }
+    xSemaphoreGive(mutex);
+  }
+} messageQueue;
+
+class MyMesh : public BaseChatMesh, ContactVisitor {
+    FILESYSTEM* _fs;
+    NodePrefs _prefs;
+    WiFiPrefs _wifi;
+    LogPrefs _logp;
+    TelemetryRules _telemetry;
+    LoggerMeshTables* _tables;
+    uint32_t expected_ack_crc;
+    ChannelDetails* _public;
+    unsigned long last_msg_sent;
+    std::vector<String> chatHistory;
+    long chatHistoryId = 0;
+
+    ContactInfo* curr_recipient;
+    ContactInfo* curr_telemetry;
+    TelemetryRule* curr_telemetry_rule;
+    uint32_t pending_login;
+    uint32_t pending_telemetry;
+    uint32_t prev_pending_telemetry;
+    int pending_telemetry_retries = 0;
+    long pending_telemetry_next = 0;
+    long telemetry_eta = 0;
+
+    char command[512+10];
+    uint8_t tmp_buf[256];
+    char hex_buf[512];
+
+    // debug toggle flag
+    bool m_debugPrint = false;
+
+    // pkt decoded?
+    bool rawDecoded = false;
+    bool ntpSynced = false;
+
+    const char* getTypeName(uint8_t type) const {
+        if (type == ADV_TYPE_CHAT) return "Chat";
+        if (type == ADV_TYPE_REPEATER) return "Repeater";
+        if (type == ADV_TYPE_ROOM) return "Room";
+        return "??";  // unknown
+    }
+
+    void loadContacts() {
+        if (_fs->exists("/contacts")) {
+            File file = _fs->open("/contacts");
+            if (file) {
+                bool full = false;
+                while (!full) {
+                ContactInfo c;
+                uint8_t pub_key[32];
+                uint8_t unused;
+                uint32_t reserved;
+
+                bool success = (file.read(pub_key, 32) == 32);
+                success = success && (file.read((uint8_t *) &c.name, 32) == 32);
+                success = success && (file.read(&c.type, 1) == 1);
+                success = success && (file.read(&c.flags, 1) == 1);
+                success = success && (file.read(&unused, 1) == 1);
+                success = success && (file.read((uint8_t *) &reserved, 4) == 4);
+                success = success && (file.read((uint8_t *) &c.out_path_len, 1) == 1);
+                success = success && (file.read((uint8_t *) &c.last_advert_timestamp, 4) == 4);
+                success = success && (file.read(c.out_path, 64) == 64);
+                c.gps_lat = c.gps_lon = 0;   // not yet supported
+
+                if (!success) break;  // EOF
+
+                c.id = mesh::Identity(pub_key);
+                c.lastmod = 0;
+                    if (!addContact(c)) full = true;
+                }
+                file.close();
+            }
+        }
+    }
+
+    void loadTelemetryRules() {
+        // delete old
+        Serial.println("Free telemetry memory");
+        for (TelemetryRule* r : _telemetry.rules) {
+            delete r;
+        }
+        _telemetry.rules.clear();
+
+        if (_fs->exists("/telemetry")) {
+            File file = _fs->open("/telemetry");
+            if (file) {
+                bool success = file.read((uint8_t *) &_telemetry.version, sizeof(_telemetry.version));
+                success = success && file.read((uint8_t *) &_telemetry.retries, sizeof(_telemetry.retries));
+                success = success && file.read((uint8_t *) &_telemetry.reserved0, sizeof(_telemetry.reserved0));
+                success = success && file.read((uint8_t *) &_telemetry.reserved1, sizeof(_telemetry.reserved1));
+                success = success && file.read((uint8_t *) &_telemetry.reserved2, sizeof(_telemetry.reserved2));
+
+                if (!success) {
+                    Serial.println("ERROR: failed to load telemetry rules");
+                    return;
+                }
+
+                if (_telemetry.version != TELEMETRY_VERSION) {
+                    // run migrations. none yet.
+                }
+
+                while (_telemetry.rules.size() < TELEMETRY_MAX_RULES) {
+                    TelemetryRule* rule = new TelemetryRule();
+
+                    success = (file.read(rule->pubkey, PUB_KEY_SIZE) == PUB_KEY_SIZE);
+                    success = success && (file.read((uint8_t *) &rule->key_len, 1) == 1);
+                    success = (file.read(rule->path, MAX_PATH_SIZE) == MAX_PATH_SIZE);
+                    success = success && (file.read((uint8_t *) &rule->path_len, 1) == 1);
+                    success = success && (file.read((uint8_t *) &rule->password, 16) == 16);
+                    success = success && (file.read((uint8_t *) &rule->start, 4) == 4);
+                    success = success && (file.read((uint8_t *) &rule->interval, 4) == 4);
+                    success = success && (file.read((uint8_t *) &rule->next, 4) == 4);
+
+                    if (rule->interval < TELEMETRY_MIN_INTERVAL) {
+                        rule->interval = TELEMETRY_MIN_INTERVAL;
+                    }
+
+                    if (!success) {
+                        delete rule;
+                        break;
+                    }
+
+                    rule->next = 0;
+                    _telemetry.rules.push_back(rule);
+                }
+                file.close();
+            }
+        }
+    }
+
+    bool _checkedWrite(File &file, uint8_t* data, int size) {
+        return file.write(data, size) == size;
+    }
+
+    void saveTelemetryRules() {
+        File file = _fs->open("/telemetry", "w", true);
+        if (file) {
+            bool success = _checkedWrite(file, (uint8_t *) &_telemetry.version, sizeof(_telemetry.version));
+            success = success && _checkedWrite(file, (uint8_t *) &_telemetry.retries, sizeof(_telemetry.retries));
+            success = success && _checkedWrite(file, (uint8_t *) &_telemetry.reserved0, sizeof(_telemetry.reserved0));
+            success = success && _checkedWrite(file, (uint8_t *) &_telemetry.reserved1, sizeof(_telemetry.reserved1));
+            success = success && _checkedWrite(file, (uint8_t *) &_telemetry.reserved2, sizeof(_telemetry.reserved2));
+
+            if (!success) {
+                Serial.println("ERROR: Failed to save telemetry rules");
+                return;
+            }
+
+            for (int i=0; i<_telemetry.rules.size() && i < TELEMETRY_MAX_RULES; i++) {
+                TelemetryRule* rule = _telemetry.rules[i];
+
+                success = _checkedWrite(file, rule->pubkey, PUB_KEY_SIZE);
+                success = success && _checkedWrite(file, (uint8_t *) &rule->key_len, 1);
+                success = success && _checkedWrite(file, rule->path, MAX_PATH_SIZE);
+                success = success && _checkedWrite(file, (uint8_t *) &rule->path_len, 1);
+                success = success && _checkedWrite(file, (uint8_t *) &rule->password, 16);
+                success = success && _checkedWrite(file, (uint8_t *) &rule->start, 4);
+                success = success && _checkedWrite(file, (uint8_t *) &rule->interval, 4);
+                success = success && _checkedWrite(file, (uint8_t *) &rule->next, 4);
+
+                if (!success) {
+                    Serial.printf("ERROR: Failed to save telemetry rule %d\n", i);
+                    break;  // write failed
+                }
+            }
+            file.close();
+        }
+    }
+
+    void deleteChannels() {
+        if (_fs->exists("/channels2")) {
+            _fs->remove("/channels2");
+        }
+    }
+
+    void loadChannels() {
+        if (_fs->exists("/channels2")) {
+            File file = _fs->open("/channels2");
+            if (file) {
+                bool full = false;
+                uint8_t channel_idx = 0;
+                while (!full) {
+                ChannelDetails ch;
+                uint8_t unused[4];
+
+                bool success = (file.read(unused, 4) == 4);
+                success = success && (file.read((uint8_t *)ch.name, 32) == 32);
+                success = success && (file.read((uint8_t *)ch.channel.secret, 32) == 32);
+
+                if (!success) break; // EOF
+
+                if (setChannel(channel_idx, ch)) {
+                    channel_idx++;
+                } else {
+                    full = true;
+                }
+                }
+                file.close();
+            }
+        }
+    }
+
+    void saveChannels() {
+        File file = _fs->open("/channels2", "w", true);
+        if (file) {
+            uint8_t channel_idx = 0;
+            ChannelDetails ch;
+            uint8_t unused[4];
+            memset(unused, 0, 4);
+
+            while (getChannel(channel_idx, ch)) {
+                bool success = (file.write(unused, 4) == 4);
+                success = success && (file.write((uint8_t *)ch.name, 32) == 32);
+                success = success && (file.write((uint8_t *)ch.channel.secret, 32) == 32);
+
+                if (!success) break; // write failed
+                channel_idx++;
+            }
+            file.close();
+        }
+    }
+
+    void saveContacts() {
+        File file = _fs->open("/contacts", "w", true);
+        if (file) {
+            ContactsIterator iter;
+            ContactInfo c;
+            uint8_t unused = 0;
+            uint32_t reserved = 0;
+
+            while (iter.hasNext(this, c)) {
+                bool success = (file.write(c.id.pub_key, 32) == 32);
+                success = success && (file.write((uint8_t *) &c.name, 32) == 32);
+                success = success && (file.write(&c.type, 1) == 1);
+                success = success && (file.write(&c.flags, 1) == 1);
+                success = success && (file.write(&unused, 1) == 1);
+                success = success && (file.write((uint8_t *) &reserved, 4) == 4);
+                success = success && (file.write((uint8_t *) &c.out_path_len, 1) == 1);
+                success = success && (file.write((uint8_t *) &c.last_advert_timestamp, 4) == 4);
+                success = success && (file.write(c.out_path, 64) == 64);
+
+                if (!success) break;  // write failed
+            }
+            file.close();
+        }
+    }
+
+public:
+    bool dbg = false;
+
+    struct {
+        long last = 0;
+        struct {
+            uint64_t packets = 0;
+            uint64_t packets_total = 0;
+            uint64_t air_time = 0;
+            uint64_t air_time_total = 0;
+        } rx;
+        struct {
+            uint64_t packets = 0;
+            uint64_t packets_total = 0;
+            uint64_t air_time = 0;
+            uint64_t air_time_total = 0;
+        } tx;
+
+        float getDuty(long now, uint64_t air_time) {
+            long tdelta = now - last;
+            float duty = (static_cast<float>(air_time) / (now - last)) * 100.0f;
+            if (duty >= 100 || duty < 0) return 0;
+            return duty;
+        }
+
+        void reset(bool full=false) {
+            rx.packets = 0;
+            rx.air_time = 0;
+            tx.packets = 0;
+            tx.air_time = 0;
+
+            if (full) {
+                rx.packets_total = 0;
+                rx.air_time_total = 0;
+                tx.packets_total = 0;
+                tx.air_time_total = 0;
+            }
+
+            last = millis();
+        }
+    } stats;
+
+    void addHistory(String str) {
+        if (chatHistory.size() > 50) chatHistory.erase(chatHistory.begin());
+        chatHistory.push_back(str);
+    }
+
+    int getHistorySize() {
+        return chatHistory.size();
+    }
+
+    String getHistory(int index) {
+            if (index >= chatHistory.size()) return "";
+            return chatHistory[index];
+        }
+
+    void setClock(uint32_t timestamp, bool ntp) {
+        static bool clockSynced = false;
+        uint32_t curr = getRTCClock()->getCurrentTime();
+        if (timestamp > curr || ntp) {
+            getRTCClock()->setCurrentTime(timestamp);
+            if (!ntp && !ntpSynced) {
+                Serial.println("   Synced local");
+                timeval epoch = {timestamp, 0};
+                settimeofday((const timeval*)&epoch, 0);
+                // update local
+            } else {
+                ntpSynced = true;
+            }
+            if (!clockSynced) {
+                // send out initial Advertisement to the mesh
+                sendSelfAdvert(1200);   // add slight delay
+                clockSynced = true;
+            }
+            Serial.println("   (OK - clock set!)");
+        } else {
+            Serial.println("   (ERR: clock cannot go backwards)");
+        }
+    }
+
+    const NodePrefs* getNodePrefs() { return &_prefs; }
+    const LogPrefs* getLogPrefs() { return &_logp; }
+    const WiFiPrefs* getWiFiPrefs() { return &_wifi; }
+    const TelemetryRules* getTelemetryRules() { return &_telemetry; }
+    const bool debugPrint() { return m_debugPrint; }
+    const bool isNtpSynced() { return ntpSynced; }
+    void setNtpSynced(bool syn) { ntpSynced = syn; }
+
+private:
+    void importCard(const char* command) {
+        while (*command == ' ') command++;   // skip leading spaces
+        if (memcmp(command, "meshcore://", 11) == 0) {
+            command += 11;  // skip the prefix
+            char *ep = strchr(command, 0);  // find end of string
+            while (ep > command) {
+                ep--;
+                if (mesh::Utils::isHexChar(*ep)) break;  // found tail end of card
+                *ep = 0;  // remove trailing spaces and other junk
+            }
+            int len = strlen(command);
+            if (len % 2 == 0) {
+                len >>= 1;  // halve, for num bytes
+                if (mesh::Utils::fromHex(tmp_buf, len, command)) {
+                    importContact(tmp_buf, len);
+                    return;
+                }
+            }
+        }
+        Serial.println("   error: invalid format");
+    }
+
+protected:
+    float getAirtimeBudgetFactor() const override {
+        return _prefs.airtime_factor;
+    }
+
+    int calcRxDelay(float score, uint32_t air_time) const override {
+        return 0;  // disable rxdelay
+    }
+
+    bool allowPacketForward(const mesh::Packet* packet) override {
+        return _logp.dofwd && _tables->hasSeen2(packet);
+    }
+
+    //void BaseChatMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len)
+
+    const char* type2str(int type) {
+        if(type == PAYLOAD_TYPE_REQ) return "REQ";
+        else if(type == PAYLOAD_TYPE_RESPONSE) return "RESPONSE";
+        else if(type == PAYLOAD_TYPE_TXT_MSG) return "TXT_MSG";
+        else if(type == PAYLOAD_TYPE_ACK) return "ACK";
+        else if(type == PAYLOAD_TYPE_ADVERT) return "ADVERT";
+        else if(type == PAYLOAD_TYPE_GRP_TXT) return "GRP_TXT";
+        else if(type == PAYLOAD_TYPE_GRP_DATA) return "GRP_DATA";
+        else if(type == PAYLOAD_TYPE_ANON_REQ) return "ANON_REQ";
+        else if(type == PAYLOAD_TYPE_PATH) return "PATH";
+        else if(type == PAYLOAD_TYPE_TRACE) return "TRACE";
+        return "Unknown";
+    }
+
+    const char* getLogDateTime() {
+        static char tmp[32];
+        uint32_t now = getRTCClock()->getCurrentTime();
+        DateTime dt = DateTime(now);
+        sprintf(tmp, "%02d:%02d:%02d - %d/%d/%d U", dt.hour(), dt.minute(), dt.second(), dt.day(), dt.month(),
+                dt.year());
+        return tmp;
+    }
+
+    void logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
+        if (_logp.usbraw) {
+            Serial.print(getLogDateTime());
+            Serial.print(" RAW: ");
+            mesh::Utils::printHex(Serial, raw, len);
+            Serial.println();
+        }
+    }
+
+    void logRx(mesh::Packet *pkt, int len, float score) {
+        uint32_t air_time = _radio->getEstAirtimeFor(len);
+        stats.rx.packets++;
+        stats.rx.packets_total++;
+        stats.rx.air_time += air_time;
+        stats.rx.air_time_total += air_time;
+        if (stats.last == 0) stats.last = millis();
+
+        if (_logp.usbraw) {
+            Serial.print(getLogDateTime());
+            Serial.printf(": RX, len=%d (type=%d, route=%s, payload_len=%d) SNR=%d RSSI=%d score=%d time=%d", 
+                    pkt->getRawLength(), pkt->getPayloadType(), pkt->isRouteDirect() ? "D" : "F", pkt->payload_len,
+                    (int)pkt->getSNR(), (int)_radio->getLastRSSI(), (int)(score*1000), air_time);
+
+            static uint8_t packet_hash[MAX_HASH_SIZE];
+            pkt->calculatePacketHash(packet_hash);
+            Serial.print(" hash=");
+            mesh::Utils::printHex(Serial, packet_hash, MAX_HASH_SIZE);
+
+            if (pkt->getPayloadType() == PAYLOAD_TYPE_PATH || pkt->getPayloadType() == PAYLOAD_TYPE_REQ
+                    || pkt->getPayloadType() == PAYLOAD_TYPE_RESPONSE || pkt->getPayloadType() == PAYLOAD_TYPE_TXT_MSG) {
+                Serial.printf(" [%02X -> %02X]\n", (uint32_t)pkt->payload[1], (uint32_t)pkt->payload[0]);
+            } else {
+                Serial.printf("\n");
+            }
+        }
+    }
+
+    void logTx(mesh::Packet *pkt, int len) {
+        uint32_t air_time = _radio->getEstAirtimeFor(len);
+        stats.tx.packets++;
+        stats.tx.packets_total++;
+        stats.tx.air_time += air_time;
+        stats.tx.air_time_total += air_time;
+        if (stats.last == 0) stats.last = millis();
+    }
+
+    mesh::DispatcherAction onRecvPacket(mesh::Packet* pkt) override {
+        // process packet
+        rawDecoded = false;
+        mesh::DispatcherAction act = Mesh::onRecvPacket(pkt);
+
+        // log raw
+        if (_logp.doraw) {
+            int phType = (pkt->header >> PH_TYPE_SHIFT) & PH_TYPE_MASK;
+
+            if (debugPrint()) {
+                Serial.println("[RAW] Received packet:");
+                Serial.printf("      header:          %u\n", pkt->header);
+                Serial.printf("        route-type:    %u\n", pkt->header & PH_ROUTE_MASK); // 2 bits
+                Serial.printf("        payload-type:  %s (%u)\n", type2str(phType), phType); // 4 bits
+                Serial.printf("        payload-vers:  %u\n", (pkt->header >> PH_VER_SHIFT) & PH_VER_MASK); // 2 bits
+                Serial.printf("      payload_len:     %u\n", pkt->payload_len);
+                Serial.printf("      path_len:        %u\n", pkt->path_len);
+                Serial.printf("      transport_codes: %u %u\n", pkt->transport_codes[0], pkt->transport_codes[1]);
+                Serial.printf("      snr:             %i\n", pkt->_snr);
+                Serial.println();
+            }
+
+            uint8_t hash[MAX_HASH_SIZE];
+            pkt->calculatePacketHash(hash);
+
+            char sender[(PUB_KEY_SIZE * 2) + 1];
+            char payload[(pkt->payload_len * 2) + 1];
+            char strhash[MAX_HASH_SIZE * 2 + 1];
+
+            mesh::Utils::toHex(sender, self_id.pub_key, PUB_KEY_SIZE);
+            mesh::Utils::toHex(payload, pkt->payload, pkt->payload_len);
+            mesh::Utils::toHex(strhash, hash, MAX_HASH_SIZE);
+
+            JsonDocument doc;
+            doc["version"] = 1;
+            doc["type"] = "RAW";
+            doc["reporter"] = sender;
+            doc["time"]["local"] = getRTCClock()->getCurrentTime();
+            doc["packet"]["header"] = pkt->header;
+            doc["packet"]["path"] = getPath(pkt);
+            doc["packet"]["payload"] = payload;
+            doc["packet"]["snr"] = pkt->getSNR();
+            doc["packet"]["hash_size"] = pkt->getPathHashSize();
+            doc["packet"]["decoded"] = rawDecoded ? 1 : 0;
+            messageQueue.push(doc);
+        }
+
+        return act;
+    }
+
+  AdvertDataParser* reportAdv(mesh::Packet* pkt, bool is_new) {
+        AdvertDataParser* parser = nullptr;
+        int i = 0;
+        mesh::Identity id;
+        memcpy(id.pub_key, &pkt->payload[i], PUB_KEY_SIZE); i += PUB_KEY_SIZE;
+        uint32_t timestamp;
+        memcpy(&timestamp, &pkt->payload[i], 4); i += 4;
+        const uint8_t* signature = &pkt->payload[i]; i += SIGNATURE_SIZE;
+        uint8_t* app_data = &pkt->payload[i];
+        int app_data_len = pkt->payload_len - i;
+
+        if (i > pkt->payload_len) {
+            // Incomplete packet
+            return parser;
+        }
+
+        parser = new AdvertDataParser(app_data, app_data_len);
+        if (!(parser->isValid() && parser->hasName())) {
+            Serial.printf("ERROR: onAdvertRecv: invalid app_data, or name is missing: len=%d\n", app_data_len);
+            return parser;
+        }
+
+        uint8_t hash[MAX_HASH_SIZE];
+        pkt->calculatePacketHash(hash);
+
+        char pubkey[(PUB_KEY_SIZE * 2) + 1];
+        char sender[(PUB_KEY_SIZE * 2) + 1];
+        char strhash[MAX_HASH_SIZE * 2 + 1];
+
+        mesh::Utils::toHex(pubkey, id.pub_key, PUB_KEY_SIZE);
+        mesh::Utils::toHex(sender, self_id.pub_key, PUB_KEY_SIZE);
+        mesh::Utils::toHex(strhash, hash, MAX_HASH_SIZE);
+
+        JsonDocument doc;
+        doc["version"] = 1;
+        doc["type"] = "ADV";
+        doc["reporter"] = sender;
+        doc["hash"] = strhash;
+        doc["snr"] = pkt->getSNR();
+        doc["hash_size"] = pkt->getPathHashSize();
+        doc["time"]["local"] = getRTCClock()->getCurrentTime();
+        doc["time"]["sender"] = timestamp;
+        doc["contact"]["new"] = is_new;
+        doc["contact"]["type"] = parser->getType();
+        doc["contact"]["feat1"] = parser->getFeat1();
+        doc["contact"]["feat2"] = parser->getFeat2();
+        doc["contact"]["flags"] = app_data[0];
+        doc["contact"]["name"] = parser->getName();
+        doc["contact"]["pubkey"] = pubkey;
+        doc["contact"]["lat"] = parser->getIntLat();
+        doc["contact"]["lon"] = parser->getIntLon();
+        doc["message"]["path"] = getPath(pkt);
+        messageQueue.push(doc);
+        rawDecoded = true;
+
+        return parser;
+    }
+
+    void onAdvertRecv(mesh::Packet* pkt, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len) {
+        ContactInfo* from = lookupContactByPubKey(id.pub_key, PUB_KEY_SIZE);
+        bool is_new = from == NULL;
+        BaseChatMesh::onAdvertRecv(pkt, id, timestamp, app_data, app_data_len);  // chain to super impl
+        from = lookupContactByPubKey(id.pub_key, PUB_KEY_SIZE);
+
+        if (!from) {
+            if (!_logp.usbraw) Serial.println("ERROR: onAdvertRecv: Contact not found!");
+        }
+
+        AdvertDataParser* parser = reportAdv(pkt, is_new);
+
+        // Serial prints
+        if (parser && debugPrint() && !_logp.usbraw) {
+            Serial.printf("ADVERT from -> %s\n", parser->getName());
+            Serial.printf("  lat:       %.6f\n", parser->getIntLat() / 1000000.0);
+            Serial.printf("  lon:       %.6f\n", parser->getIntLon() / 1000000.0);
+        }
+
+        if (parser) {
+            delete parser;
+        }
+    }
+
+    void onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t* path) override {
+        saveContacts();
+    }
+
+    String getPath(mesh::Packet* pkt) {
+        String path = "";
+        int hashsize = pkt->getPathHashSize();
+        int hops = pkt->getPathHashCount();
+        int blen = pkt->getPathByteLen();
+        
+        if (!pkt->isRouteDirect()) {
+            int partsize = 0;
+            char buf[4];
+
+            for (size_t i = 0; i < blen; i++) {
+                if (partsize == 0 && i != 0) {
+                path += ",";
+                }
+
+                sprintf(buf, "%02x", pkt->path[i]);
+                path += buf;
+
+                partsize++;
+                if (partsize == hashsize) {
+                partsize = 0;
+                }
+            }
+        }
+        return path;
+    }
+
+    void onContactPathUpdated(const ContactInfo& contact) override {
+        Serial.printf("PATH to: %s, path_len=%d, path=", contact.name, (int32_t) contact.out_path_len);
+        for (int i=0;i<contact.out_path_len;i++) {
+            if (i != 0) Serial.print(",");
+            Serial.printf("%02X", contact.out_path[i]);
+        }
+        Serial.println();
+        saveContacts();
+    }
+
+    ContactInfo* processAck(const uint8_t *data) override {
+        if (memcmp(data, &expected_ack_crc, 4) == 0) {     // got an ACK from recipient
+            Serial.printf("   Got ACK! (round trip: %d millis)\n", _ms->getMillis() - last_msg_sent);
+            expected_ack_crc = 0;
+            return NULL;  // TODO: really should return ContactInfo pointer 
+        }
+
+        return NULL;
+    }
+
+    mesh::Packet* composeMsgPacket2(const ContactInfo& recipient, uint32_t timestamp, uint8_t attempt, const char *text, uint32_t& expected_ack) {
+        int text_len = strlen(text);
+        if (text_len > MAX_TEXT_LEN) return NULL;
+        if (attempt > 3 && text_len > MAX_TEXT_LEN-2) return NULL;
+
+        uint8_t temp[5+MAX_TEXT_LEN+1];
+        memcpy(temp, &timestamp, 4);   // mostly an extra blob to help make packet_hash unique
+        temp[4] = (attempt & 3);
+        memcpy(&temp[5], text, text_len + 1);
+
+        // calc expected ACK reply
+        mesh::Utils::sha256((uint8_t *)&expected_ack, 4, temp, 5 + text_len, self_id.pub_key, PUB_KEY_SIZE);
+
+        int len = 5 + text_len;
+        if (attempt > 3) {
+            temp[len++] = 0;  // null terminator
+            temp[len++] = attempt;  // hide attempt number at tail end of payload
+        }
+
+        return createDatagram(PAYLOAD_TYPE_TXT_MSG, recipient.id, recipient.getSharedSecret(self_id), temp, len);
+    }
+
+    void onMessageRecv(const ContactInfo& from, mesh::Packet* pkt, uint32_t sender_timestamp, const char *text) override {
+        uint8_t hash[MAX_HASH_SIZE];
+        pkt->calculatePacketHash(hash);
+
+        char pubkey[(PUB_KEY_SIZE * 2) + 1];
+        char sender[(PUB_KEY_SIZE * 2) + 1];
+        char strhash[MAX_HASH_SIZE * 2 + 1];
+
+        mesh::Utils::toHex(pubkey, from.id.pub_key, PUB_KEY_SIZE);
+        mesh::Utils::toHex(sender, self_id.pub_key, PUB_KEY_SIZE);
+        mesh::Utils::toHex(strhash, hash, MAX_HASH_SIZE);
+
+        JsonDocument doc;
+        doc["version"] = 1;
+        doc["type"] = "MSG";
+        doc["reporter"] = sender;
+        doc["hash"] = strhash;
+        doc["snr"] = pkt->getSNR();
+        doc["hash_size"] = pkt->getPathHashSize();
+        doc["time"]["local"] = getRTCClock()->getCurrentTime();
+        doc["time"]["sender"] = sender_timestamp;
+        doc["contact"]["type"] = from.type;
+        doc["contact"]["flags"] = from.flags;
+        doc["contact"]["pubkey"] = pubkey;
+        doc["contact"]["name"] = from.name;
+        doc["contact"]["lat"] = from.gps_lat;
+        doc["contact"]["lon"] = from.gps_lon;
+        doc["message"]["text"] = text;
+        doc["message"]["header"] = pkt->header;
+        doc["message"]["path"] = getPath(pkt);
+        messageQueue.push(doc);
+        rawDecoded = true;
+
+        // Serial prints
+        if (!_logp.usbraw) Serial.printf("MESSAGE from -> %s\n", from.name);
+
+        // Special commands
+        if (strcmp(text, "clock sync") == 0) {  // special text command
+            setClock(sender_timestamp + 1, false);
+        }
+
+        ContactsIterator iter;
+        ContactInfo c;
+        int contactId = -1;
+        int i = 0;
+
+        while (iter.hasNext(this, c)) {
+            if (memcmp(c.id.pub_key, from.id.pub_key, PUB_KEY_SIZE) == 0) {
+                contactId = i;
+                break;
+            }
+            i++;
+        }
+
+        String msgData;
+        JsonDocument doc2;
+        doc2["type"] = "direct_message";
+        doc2["data"] = doc;
+        doc2["data"]["cid"] = contactId;
+        serializeJson(doc2, msgData);
+    #ifdef WEBSERVER_ENABLE
+        ws.printfAll(msgData.c_str());
+    #endif
+    }
+
+    void onCommandDataRecv(const ContactInfo& from, mesh::Packet* pkt, uint32_t sender_timestamp, const char *text) override {}
+
+    void onSignedMessageRecv(const ContactInfo& from, mesh::Packet* pkt, uint32_t sender_timestamp, const uint8_t *sender_prefix, const char *text) override {}
+
+    void onChannelMessageRecv(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t timestamp, const char *text) override {
+        uint8_t hash[MAX_HASH_SIZE];
+        pkt->calculatePacketHash(hash);
+
+        char chhash[(PUB_KEY_SIZE * 2) + 1];
+        char sender[(PUB_KEY_SIZE * 2) + 1];
+        char strhash[MAX_HASH_SIZE * 2 + 1];
+
+        mesh::Utils::toHex(chhash, channel.hash, PATH_HASH_SIZE);
+        mesh::Utils::toHex(sender, self_id.pub_key, PUB_KEY_SIZE);
+        mesh::Utils::toHex(strhash, hash, MAX_HASH_SIZE);
+
+        JsonDocument doc;
+        doc["version"] = 1;
+        doc["type"] = "PUB";
+        doc["reporter"] = sender;
+        doc["hash"] = strhash;
+        doc["snr"] = pkt->getSNR();
+        doc["hash_size"] = pkt->getPathHashSize();
+        doc["time"]["local"] = getRTCClock()->getCurrentTime();
+        doc["time"]["sender"] = timestamp;
+        doc["message"]["text"] = text;
+        doc["message"]["header"] = pkt->header;
+        doc["message"]["path"] = getPath(pkt);
+        doc["channel"]["hash"] = chhash;
+        messageQueue.push(doc);
+        rawDecoded = true;
+
+        if (pkt->isRouteDirect()) {
+            if (!_logp.usbraw) Serial.printf("PUBLIC CHANNEL MSG -> (Direct!)\n");
+        } else {
+            if (!_logp.usbraw) Serial.printf("PUBLIC CHANNEL MSG -> (Flood) hops %d, %d byte hash)\n", pkt->getPathHashCount(), pkt->getPathHashSize());
+        }
+
+        Serial.printf("   %s\n", text);
+
+        if (_tables->hasSeen2(pkt)) return;
+
+        JsonDocument doc2;
+        doc2["type"] = "channel_message";
+        doc2["data"]["t"] = timestamp;
+        doc2["data"]["m"] = text;
+        doc2["data"]["p"] = getPath(pkt);
+        doc2["data"]["c"] = chhash;
+        doc2["data"]["h"] = strhash;
+        doc2["data"]["ch"] = findChannelIdx(channel);
+        doc2["data"]["id"] = chatHistoryId++;
+
+        String msgData;
+        serializeJson(doc2, msgData);
+        addHistory(msgData);
+    #ifdef WEBSERVER_ENABLE
+        ws.printfAll(msgData.c_str());
+    #endif
+        // Slash commands
+        // Dont run in public
+        if (channel.hash[0] == 0x11) return;
+
+        int start = 0;
+        int inlen = strlen(text);
+        for (int i=0;i<inlen-3;i++) {
+            if (text[i] == ':' && text[i+2] == '/') {
+                start = i + 2;
+                if (dbg) Serial.printf("Start at %u -> %c\n", start, text[start]);
+                break;
+            }
+        }
+
+        if (start <= 0) return;
+
+        String rep = "";
+        std::vector<String> parts = split(&text[start], 2); // 0 - cmd, 1 - to/data
+        if (parts.size() < 1) return;
+
+        String cmd = parts[0];
+        String data = "";
+
+        bool hasRecipient = false;
+        bool reply = false;
+
+        if (parts.size() >= 2) {
+            data = parts[1];
+            int npos = data.indexOf("@[");
+            hasRecipient = npos != -1;
+        }
+
+        if (hasRecipient) {
+            char lookup[40];
+            int llen = sprintf(lookup, "@[%s]", getNodePrefs()->node_name);
+            if (llen < 4) return; // sprintf failed or bad name
+
+            int npos = data.indexOf(lookup);
+            reply = npos != -1;
+            data = data.substring(npos + llen); // remove recipient name
+        }
+
+        if (dbg) {
+            Serial.print("Bot Command:\n");
+            Serial.printf("  reply:        %u\n", reply);
+            Serial.printf("  hasRecipient: %u\n", hasRecipient);
+            Serial.printf("  cmd:          %s\n", cmd.c_str());
+        }
+
+        if (!reply) return;
+
+        if (cmd == "/echo") {
+            data.trim();
+            if (data.length() > 0) {
+                rep = "Echo: ";
+                rep += data;
+            } else {
+                rep = "Echo.";
+            }
+        } else if (cmd == "/ping") {
+            rep = "Pong! ";
+            int hops = pkt->getPathHashCount();
+            if (hops == 0) {
+                rep += "0 hops";
+            } else {
+                char buf[3];
+                rep += hops;
+                rep += " hop";
+                if (hops != 1) rep += "s";
+                rep += ": ";
+                rep += getPath(pkt);
+            }
+        } else {
+            return; // unknown command
+        }
+
+        if (rep.length() > 0) {
+            if (dbg) Serial.print("CMD Reply: ");
+            if (dbg) Serial.println(rep);
+            uint8_t temp[5+MAX_TEXT_LEN+32];
+            uint32_t otimestamp = getRTCClock()->getCurrentTime();
+            memcpy(temp, &otimestamp, 4);
+            temp[4] = 0;
+            int len = sprintf((char *) &temp[5], "%s: %s", _prefs.node_name, rep.c_str());
+
+            if (len > 0) {
+                len += 5; //timestamp + flags
+                mesh::Packet* opkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, channel, temp, len);
+                if (opkt != NULL) {
+                    sendFlood(opkt, 3000, pkt->getPathHashSize());
+                }
+            }
+        }
+    }
+
+    uint8_t onContactRequest(const ContactInfo& contact, uint32_t sender_timestamp, const uint8_t* data, uint8_t len, uint8_t* reply) override {
+        return 0;  // unknown
+    }
+
+    void onContactResponse(const ContactInfo& contact, const uint8_t* data, uint8_t len) override {
+        uint32_t tag;
+        memcpy(&tag, data, 4);
+
+        if (dbg) Serial.printf("onContactResponse: %08X - %02X\n", tag, data[4]);
+        if (pending_login && memcmp(&pending_login, contact.id.pub_key, 4) == 0) {
+            // response to pending sendLogin()
+            pending_login = 0;
+            if (data[4] == RESP_SERVER_LOGIN_OK) {
+                pending_telemetry_retries = 0;
+                pending_telemetry_next = millis() + 500;
+                pending_telemetry = 1;
+                telemetry_eta = millis() - telemetry_eta;
+                if (dbg) Serial.printf("Login OK, took %u ms\n", telemetry_eta);
+                if (curr_telemetry_rule) curr_telemetry_rule->loggedin = true;
+                rawDecoded = true;
+            }
+        } else if (len > 4 && tag == pending_telemetry || tag == prev_pending_telemetry) {  // check for matching response tag
+            String name = curr_telemetry ? curr_telemetry->name : "?";
+            curr_telemetry = nullptr;
+            pending_telemetry = 0;
+            pending_telemetry_retries = 0;
+            CayenneLPP telemetry(len - 4);
+
+            char pubkey[(PUB_KEY_SIZE * 2) + 1];
+            char sender[(PUB_KEY_SIZE * 2) + 1];
+
+            mesh::Utils::toHex(pubkey, contact.id.pub_key, PUB_KEY_SIZE);
+            mesh::Utils::toHex(sender, self_id.pub_key, PUB_KEY_SIZE);
+
+            JsonDocument doc;
+            doc["version"] = 1;
+            doc["type"] = "TEL";
+            doc["reporter"] = sender;
+            doc["telemetry"] = JsonArray();
+            doc["contact"]["pubkey"] = pubkey;
+            doc["time"]["local"] = getRTCClock()->getCurrentTime();
+            doc["time"]["sender"] = getRTCClock()->getCurrentTime();
+
+            JsonArray telemetryRoot = doc["telemetry"].to<JsonArray>();
+
+            //decode(uint8_t *buffer, uint8_t size, JsonArray &root);
+            if (dbg) Serial.println("decode telemetry");
+            telemetry.decode((uint8_t*) &data[4], len - 4, telemetryRoot);
+            messageQueue.push(doc);
+            rawDecoded = true;
+
+            String output;
+            serializeJson(doc, output);
+            if (dbg) Serial.println(output);
+
+            String msgData;
+            JsonDocument doc2;
+            doc2["type"] = "telemetry_data";
+            doc2["data"]["m"] = output;
+            doc2["data"]["n"] = name;
+            serializeJson(doc2, msgData);
+        #ifdef WEBSERVER_ENABLE
+            ws.printfAll(msgData.c_str());
+        #endif
+        }
+    }
+
+    void telemetryRun(int id, bool login=true, bool schedule=false) {
+        if (id >= _telemetry.rules.size()) {
+            if (dbg) Serial.println("  ERROR: Bad ID");
+            return;
+        }
+
+        if (schedule) {
+            TelemetryRule* scheduled_rule = _telemetry.rules[id];
+            scheduled_rule->next = millis();
+            return;
+        }
+
+        if (curr_telemetry && !schedule) {
+            if (dbg) Serial.println("  ERROR: Already running");
+            return;
+        }
+
+        curr_telemetry_rule = _telemetry.rules[id];
+        curr_telemetry = lookupContactByPubKey(curr_telemetry_rule->pubkey, curr_telemetry_rule->key_len);
+
+        if (!curr_telemetry) {
+            if (dbg) Serial.println("  ERROR: Contact not found");
+            return;
+        }
+
+        int pwlen = strlen(curr_telemetry_rule->password);
+        if (!login || pwlen < 1 || curr_telemetry_rule->loggedin) { // no passsword allows to skip login packet
+            pending_login = 0;
+            pending_telemetry_retries = 0;
+            pending_telemetry_next = millis() + 500;
+            pending_telemetry = 1;
+        } else {
+            memcpy(&pending_login, curr_telemetry->id.pub_key, 4);
+        }
+    }
+
+    void cancelTelemetry() {
+        curr_telemetry = nullptr;
+        curr_telemetry_rule = nullptr;
+        pending_login = 0;
+        pending_telemetry = 0;
+        pending_telemetry_retries = 0;
+    }
+
+    void telemetryLoop() {
+        if (curr_telemetry && pending_telemetry_retries >= _telemetry.retries) {
+            if (pending_telemetry_next < millis()) {
+                curr_telemetry_rule->loggedin = false; // unset logged in flag.
+                if (dbg) Serial.printf("Telemetry to %s timed out\n", curr_telemetry->name);
+
+                String msgData;
+                JsonDocument doc2;
+                doc2["type"] = "telemetry_data";
+                doc2["data"]["m"] = "Telemetry read timed out";
+                doc2["data"]["n"] = curr_telemetry->name;
+                serializeJson(doc2, msgData);
+        #ifdef WEBSERVER_ENABLE
+                ws.printfAll(msgData.c_str());
+        #endif
+                cancelTelemetry();
+            }
+            return;
+        } else if (curr_telemetry) {
+            if (pending_telemetry_next > millis()) return;
+
+            pending_telemetry_next = millis() + TELEMETRY_RETRY_INTERVAL;
+            pending_telemetry_retries++;
+
+            // Always reset to force set path
+            curr_telemetry->out_path_len = curr_telemetry_rule->path_len;
+            memcpy(curr_telemetry->out_path, curr_telemetry_rule->path, sizeof(curr_telemetry->out_path));
+
+            if (pending_login) {
+                if (!curr_telemetry_rule) {
+                    cancelTelemetry();
+                    return;
+                }
+                telemetry_eta = millis();
+                uint32_t est_timeout;
+                int result = sendLogin(*curr_telemetry, curr_telemetry_rule->password, est_timeout);
+                if (dbg) Serial.printf("Telemetry login %s, result=%u, to=%u | %u/%u\n",
+                    curr_telemetry->name,
+                    result,
+                    est_timeout,
+                    pending_telemetry_retries,
+                    _telemetry.retries
+                );
+                if (result == MSG_SEND_SENT_DIRECT) {
+                    pending_telemetry_next = millis() + est_timeout + 500;
+                }else if (result == MSG_SEND_FAILED) {
+                    cancelTelemetry();
+                    return;
+                }
+            } else if (pending_telemetry) {
+                delay(1000);
+                uint32_t tag, est_timeout;
+                int result = sendRequest(*curr_telemetry, REQ_TYPE_GET_TELEMETRY_DATA, tag, est_timeout);
+                if (dbg) Serial.printf("Telemetry read %s, tag=%08X, result=%um to=%u | %u/%u\n",
+                    curr_telemetry->name,
+                    tag,
+                    result,
+                    est_timeout,
+                    pending_telemetry_retries,
+                    _telemetry.retries
+                );
+                if (result == MSG_SEND_SENT_DIRECT) {
+                    pending_telemetry_next = millis() + est_timeout + 500;
+                } else if (result == MSG_SEND_FAILED) {
+                    cancelTelemetry();
+                    return;
+                }
+                prev_pending_telemetry = pending_telemetry;
+                pending_telemetry = tag;
+            }
+        } else if (!curr_telemetry) {
+            if (!ntpSynced) return; // require ntp sync!
+
+            // check schedule
+            uint32_t now = getRTCClock()->getCurrentTime();
+            DateTime dt = DateTime(now);
+            uint32_t secondOfDay = dt.second();
+            secondOfDay += dt.minute() * 60;
+            secondOfDay += dt.hour() * 60 * 60;
+
+            int pos = 0;
+            for (TelemetryRule* rule : _telemetry.rules) {
+                if (rule->next == 0) {
+                    rule->next = now - secondOfDay + rule->start;
+                    while (rule->next < now) { // dont run on setup
+                        rule->next += rule->interval;
+                    }
+                } else if (rule->next < now) {
+                    rule->next = now + rule->interval;
+                    if (dbg) Serial.printf("Schedule %u\n", pos);
+                    telemetryRun(pos);
+                    break;
+                }
+                pos++;
+            }
+        }
+    }
+
+    uint32_t calcFloodTimeoutMillisFor(uint32_t pkt_airtime_millis) const override {
+        return SEND_TIMEOUT_BASE_MILLIS + (FLOOD_SEND_TIMEOUT_FACTOR * pkt_airtime_millis);
+    }
+
+    uint32_t calcDirectTimeoutMillisFor(uint32_t pkt_airtime_millis, uint8_t path_len) const override {
+        return SEND_TIMEOUT_BASE_MILLIS +
+            ( (pkt_airtime_millis*DIRECT_SEND_PERHOP_FACTOR + DIRECT_SEND_PERHOP_EXTRA_MILLIS) * (path_len + 1));
+    }
+
+    void onSendTimeout() override {
+        if (dbg) Serial.println("   ERROR: timed out, no ACK.");
+    }
+
+public:
+    MyMesh(mesh::Radio& radio, StdRNG& rng, mesh::RTCClock& rtc, LoggerMeshTables& tables)
+        : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(16), tables)
+    {
+        // defaults
+        memset(&_prefs, 0, sizeof(_prefs));
+        memset(&_wifi, 0, sizeof(_wifi));
+        memset(&_logp, 0, sizeof(_logp));
+        memset(&_telemetry, 0, sizeof(_telemetry));
+        _prefs.airtime_factor = 2.0;    // one third
+        strcpy(_prefs.node_name, "NONAME");
+        _prefs.freq = LORA_FREQ;
+        _prefs.tx_power_dbm = LORA_TX_POWER;
+        _prefs.path_hash_mode = 0;
+
+        _telemetry.version = TELEMETRY_VERSION;
+        _telemetry.retries = TELEMETRY_DEFAULT_RETRIES;
+
+        command[0] = 0;
+        curr_recipient = NULL;
+        _tables = &tables;
+    }
+
+    float getFreqPref() const { return _prefs.freq; }
+    uint8_t getTxPowerPref() const { return _prefs.tx_power_dbm; }
+
+    const uint8_t* getPubKey() {
+        return self_id.pub_key;
+    }
+
+    void begin(FILESYSTEM& fs) {
+        _fs = &fs;
+
+        BaseChatMesh::begin();
+
+        IdentityStore store(fs, "/identity");
+
+        if (!store.load("_main", self_id, _prefs.node_name, sizeof(_prefs.node_name))) {  // legacy: node_name was from identity file
+            // Need way to get some entropy to seed RNG
+            Serial.println("Press ENTER to generate key:");
+            char c = 0;
+            while (c != '\n') {   // wait for ENTER to be pressed
+                if (Serial.available()) c = Serial.read();
+            }
+            Serial.println("generating key...");
+            ((StdRNG *)getRNG())->begin(millis());
+
+            self_id = mesh::LocalIdentity(getRNG());  // create new random identity
+            int count = 0;
+            while (count < 10 && (self_id.pub_key[0] == 0x00 || self_id.pub_key[0] == 0xFF)) {  // reserved id hashes
+                self_id = mesh::LocalIdentity(getRNG()); count++;
+            }
+            Serial.println("done.");
+            store.save("_main", self_id);
+        }
+
+        // load persisted prefs
+        if (_fs->exists("/node_prefs")) {
+            File file = _fs->open("/node_prefs");
+            if (file) {
+                file.read((uint8_t *) &_prefs, sizeof(_prefs));
+                file.close();
+            }
+        }
+
+        // load wifi prefs
+        if (_fs->exists("/wifi_prefs")) {
+            File file = _fs->open("/wifi_prefs");
+            if (file) {
+                int read = file.read((uint8_t *) &_wifi, sizeof(_wifi));
+                file.close();
+
+                // migrate
+                if (read <= 97) {
+                uint8_t* dst = (uint8_t *) &_wifi;
+
+                // v0
+                WiFiPrefs tmp;
+                memcpy(&tmp, dst, sizeof(_wifi)); // unaligned
+                memcpy(dst+ 1, &tmp, sizeof(_wifi) - 1);
+                _wifi.version = 1;
+                _wifi.txpower = WIFI_POWER_8_5dBm;
+                saveWiFiPrefs();
+                }
+            }
+        }
+
+        // load wifi prefs
+        if (_fs->exists("/log_prefs")) {
+            File file = _fs->open("/log_prefs");
+            if (file) {
+                file.read((uint8_t *) &_logp, sizeof(_logp));
+                file.close();
+
+                if (_logp.version == 0) {
+                    _logp.version = 1;
+                    _logp.selfreport = 15 * 60; // 15 min default
+                    if (_logp.selfreport != 0 && _logp.selfreport < CONFIG_MIN_SELFREPORT_INTERVAL) {
+                        _logp.selfreport = CONFIG_MIN_SELFREPORT_INTERVAL;
+                    }
+                    saveLogPrefs();
+                }
+
+                if (_logp.version == 1) {
+                    _logp.version = 2;
+                    _logp.web = false;
+                    saveLogPrefs();
+                }
+
+                if (_logp.version == 2) {
+                    _logp.version = 3;
+                    _logp.usbraw = 0;
+                    memset(_logp.reserved, 0, 7);
+                    saveLogPrefs();
+                }
+            }
+        }
+
+        loadContacts();
+        loadChannels();
+        loadTelemetryRules();
+        _public = addChannel("Public", PUBLIC_GROUP_PSK); // pre-configure Andy's public channel
+        WiFi.setHostname(getNodePrefs()->node_name);
+
+        toggleWiFi(true);
+    }
+
+    void toggleWiFi(bool enable) {
+        if (strlen(_wifi.ssid) < 1) {
+            Serial.println("WiFi: SSID not set");
+            return;
+        }
+        if (enable) {
+            WiFi.mode(WIFI_STA);
+            WiFi.begin(_wifi.ssid, _wifi.password);
+            if (esp_wifi_set_max_tx_power(_wifi.txpower) != ESP_OK) {
+                Serial.println("failed to set tx power");
+            }
+            WiFi.setAutoReconnect(true);
+        } else {
+            Serial.println("WiFi: Disconencting");
+            WiFi.disconnect();
+        }
+    }
+
+    void savePrefs() {
+        File file = _fs->open("/node_prefs", "w", true);
+        if (file) {
+            file.write((const uint8_t *)&_prefs, sizeof(_prefs));
+            file.close();
+        }
+    }
+
+    void saveWiFiPrefs() {
+        File file = _fs->open("/wifi_prefs", "w", true);
+        if (file) {
+            file.write((const uint8_t *)&_wifi, sizeof(_wifi));
+            file.close();
+        }
+
+        toggleWiFi(false);
+        toggleWiFi(true);
+    }
+
+    void saveLogPrefs() {
+        File file = _fs->open("/log_prefs", "w", true);
+        if (file) {
+            file.write((const uint8_t *)&_logp, sizeof(_logp));
+            file.close();
+        }
+    }
+
+    void showWelcome() {
+        Serial.println("===== MeshCore Chat Terminal =====");
+        Serial.println();
+        Serial.printf("WELCOME  %s\n", _prefs.node_name);
+        mesh::Utils::printHex(Serial, self_id.pub_key, PUB_KEY_SIZE);
+        Serial.println();
+        Serial.println("   (enter 'help' for basic commands)");
+        Serial.println();
+    }
+
+    void sendSelfAdvert(int delay_millis) {
+        auto pkt = createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon);
+        if (pkt) {
+            sendFlood(pkt, delay_millis, _prefs.path_hash_mode + 1);
+            pkt->setPathHashSizeAndCount(_prefs.path_hash_mode + 1, 0);
+            AdvertDataParser* parser = reportAdv(pkt, false);
+            if (parser) delete parser;
+        }
+    }
+
+    // ContactVisitor
+    void onContactVisit(const ContactInfo& contact) override {
+        Serial.printf("   %s - ", contact.name);
+        char tmp[40];
+        int32_t secs = contact.last_advert_timestamp - getRTCClock()->getCurrentTime();
+        AdvertTimeHelper::formatRelativeTimeDiff(tmp, secs, false);
+        Serial.println(tmp);
+    }
+
+    void sendChannelMsg(const char* sender, const char* message, const mesh::GroupChannel& channel) {
+        uint8_t temp[5+MAX_TEXT_LEN+32];
+        uint32_t timestamp = getRTCClock()->getCurrentTime();
+        memcpy(temp, &timestamp, 4);   // mostly an extra blob to help make packet_hash unique
+        temp[4] = 0;  // attempt and flags
+
+        if (message) {
+            sprintf((char *) &temp[5], "%s: %s", sender, message);  // <sender>: <msg>
+        } else {
+            sprintf((char *) &temp[5], "%s", sender);
+        }
+        temp[5 + MAX_TEXT_LEN] = 0;  // truncate if too long
+
+        int len = strlen((char *) &temp[5]);
+        auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, channel, temp, 5 + len);
+        if (pkt) {
+            sendFlood(pkt, (uint32_t) 0, _prefs.path_hash_mode + 1);
+
+            _tables->hasSeen2(pkt);
+
+            uint8_t hash[MAX_HASH_SIZE];
+            pkt->calculatePacketHash(hash);
+
+            char chhash[(PUB_KEY_SIZE * 2) + 1];
+            char strhash[MAX_HASH_SIZE * 2 + 1];
+
+            mesh::Utils::toHex(chhash, channel.hash, PATH_HASH_SIZE);
+            mesh::Utils::toHex(strhash, hash, MAX_HASH_SIZE);
+
+            Serial.println("   Sent.");
+
+            JsonDocument doc2;
+            doc2["type"] = "channel_message";
+            doc2["data"]["t"] = timestamp;
+            doc2["data"]["m"] = (char *) &temp[5];
+            doc2["data"]["p"] = "flood";
+            doc2["data"]["c"] = chhash;
+            doc2["data"]["h"] = strhash;
+            doc2["data"]["ch"] = findChannelIdx(channel);
+            doc2["data"]["id"] = chatHistoryId++;
+
+            String msgData;
+            serializeJson(doc2, msgData);
+            addHistory(msgData);
+    #ifdef WEBSERVER_ENABLE
+            ws.printfAll(msgData.c_str());
+    #endif
+        } else {
+            Serial.println("   ERROR: unable to send");
+        }
+    }
+
+  void handleCommand(const char* command) {
+        while (*command == ' ') command++;  // skip leading spaces
+
+        if (memcmp(command, "get ", 4) == 0) {
+            char reply[256];
+            const char* config = &command[4];
+            if (memcmp(config, "af", 2) == 0) {
+                sprintf(reply, "> %s", StrHelper::ftoa(_prefs.airtime_factor));
+            } else if (memcmp(config, "prv.key", 7) == 0) {  // from serial command line only
+                uint8_t prv_key[PRV_KEY_SIZE];
+                int len = self_id.writeTo(prv_key, PRV_KEY_SIZE);
+                mesh::Utils::toHex((char*) tmp_buf, prv_key, len);
+                sprintf(reply, "> %s", tmp_buf);
+            } else if (memcmp(config, "name", 4) == 0) {
+                sprintf(reply, "> %s", _prefs.node_name);
+            } else if (memcmp(config, "lat", 3) == 0) {
+                sprintf(reply, "> %s", StrHelper::ftoa(_prefs.node_lat));
+            } else if (memcmp(config, "lon", 3) == 0) {
+                sprintf(reply, "> %s", StrHelper::ftoa(_prefs.node_lon));
+            } else if (memcmp(config, "radio", 5) == 0) {
+                char freq[16], bw[16];
+                strcpy(freq, StrHelper::ftoa(LORA_FREQ));
+                strcpy(bw, StrHelper::ftoa3(LORA_BW));
+                sprintf(reply, "> %s,%s,%d,%d", freq, bw, LORA_SF, LORA_CR); // (uint32_t)_prefs.sf, (uint32_t)_prefs.cr);
+            }
+            else if (memcmp(config, "path.hash.mode", 14) == 0) {
+                sprintf(reply, "> %d", (uint32_t)_prefs.path_hash_mode);
+            } 
+            else if (memcmp(config, "tx", 2) == 0 && (config[2] == 0 || config[2] == ' ')) {
+                sprintf(reply, "> %d", (int32_t) _prefs.tx_power_dbm);
+            } else if (memcmp(config, "freq", 4) == 0) {
+                sprintf(reply, "> %s", StrHelper::ftoa(LORA_FREQ));
+            } else if (memcmp(config, "public.key", 10) == 0) {
+                strcpy(reply, "> ");
+                mesh::Utils::toHex(&reply[2], self_id.pub_key, PUB_KEY_SIZE);
+            } else {
+                sprintf(reply, "??: %s", config);
+            }
+            Serial.print("  -> "); Serial.println(reply);
+            return;
+        } else if (memcmp(command, "send ", 5) == 0) {
+            if (curr_recipient) {
+                const char *text = &command[5];
+                uint32_t est_timeout;
+
+                int result = sendMessage(*curr_recipient, getRTCClock()->getCurrentTime(), 0, text, expected_ack_crc, est_timeout);
+                if (result == MSG_SEND_FAILED) {
+                    Serial.println("   ERROR: unable to send.");
+                } else {
+                    last_msg_sent = _ms->getMillis();
+                    Serial.printf("   (message sent - %s)\n", result == MSG_SEND_SENT_FLOOD ? "FLOOD" : "DIRECT");
+                }
+            } else {
+                Serial.println("   ERROR: no recipient selected (use 'to' cmd).");
+            }
+        } else if (memcmp(command, "public ", 7) == 0) {
+            sendChannelMsg(_prefs.node_name, &command[7], _public->channel);
+        } else if (memcmp(command, "public_raw ", 11) == 0) {
+            sendChannelMsg(&command[11], 0, _public->channel);
+        } else if (memcmp(command, "list", 4) == 0) {  // show Contact list, by most recent
+            int n = 0;
+            if (command[4] == ' ') {  // optional param, last 'N'
+                n = atoi(&command[5]);
+            }
+            scanRecentContacts(n, this);
+        } else if (strcmp(command, "clock") == 0) {    // show current time
+            uint32_t now = getRTCClock()->getCurrentTime();
+            DateTime dt = DateTime(now);
+            Serial.printf(   "%02d:%02d - %d/%d/%d UTC\n", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
+        } else if (memcmp(command, "time ", 5) == 0) {  // set time (to epoch seconds)
+            const char* config = &command[5];
+            if (memcmp(config, "ntp", 3) == 0) {
+                ntpSynced = false;
+            } else {
+                uint32_t secs = _atoi(config);
+                setClock(secs, false);
+            }
+        } else if (memcmp(command, "to ", 3) == 0) {  // set current recipient
+            curr_recipient = searchContactsByPrefix(&command[3]);
+            if (curr_recipient) {
+                Serial.printf("   Recipient %s now selected.\n", curr_recipient->name);
+            } else {
+                Serial.println("   Error: Name prefix not found.");
+            }
+        } else if (strcmp(command, "to") == 0) {    // show current recipient
+            if (curr_recipient) {
+                Serial.printf("   Current: %s\n", curr_recipient->name);
+            } else {
+                Serial.println("   Err: no recipient selected");
+            }
+        } else if (strcmp(command, "advert") == 0) {
+        auto pkt = createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon);
+            if (pkt) {
+                sendZeroHop(pkt);
+                AdvertDataParser* parser = reportAdv(pkt, false);
+                if (parser) delete parser;
+                Serial.println("   (advert sent, zero hop).");
+            } else {
+                Serial.println("   ERR: unable to send");
+            }
+        } else if (strcmp(command, "flood") == 0) {
+            auto pkt = createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon);
+            if (pkt) {
+                sendFlood(pkt, (uint32_t) 0, _prefs.path_hash_mode + 1);
+                AdvertDataParser* parser = reportAdv(pkt, false);
+                if (parser) delete parser;
+                Serial.println("   (advert sent, flood).");
+            } else {
+                Serial.println("   ERR: unable to send");
+            }
+        } else if (strcmp(command, "reset path") == 0) {
+            if (curr_recipient) {
+                resetPathTo(*curr_recipient);
+                saveContacts();
+                Serial.println("   Done.");
+            }
+        } else if (memcmp(command, "card", 4) == 0) {
+            Serial.printf("Hello %s\n", _prefs.node_name);
+            auto pkt = createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon);
+            if (pkt) {
+                uint8_t len =  pkt->writeTo(tmp_buf);
+                releasePacket(pkt);  // undo the obtainNewPacket()
+
+                mesh::Utils::toHex(hex_buf, tmp_buf, len);
+                Serial.println("Your MeshCore biz card:");
+                Serial.print("meshcore://"); Serial.println(hex_buf);
+                Serial.println();
+            } else {
+                Serial.println("  Error");
+            }
+        } else if (memcmp(command, "channel ", 8) == 0) {
+            const char* method = &command[8];
+            if (memcmp(method, "add ", 4) == 0) {
+                const char* psk = &method[4];
+                ChannelDetails* ch = addChannel(psk, psk);
+                if (ch) {
+                    saveChannels();
+                    Serial.println("  Channel added\n");
+                }
+            } else if (memcmp(method, "delete", 6) == 0) {
+                deleteChannels();
+                Serial.println("  OK - reboot to apply");
+            } else if (memcmp(method, "ls", 2) == 0) {
+                uint8_t channel_idx = 0;
+                ChannelDetails ch;
+                uint8_t unused[4];
+                memset(unused, 0, 4);
+
+                Serial.println("Channels:");
+                while (getChannel(channel_idx, ch)) {
+                    Serial.printf(" [%2d] %s\n", channel_idx, ch.name);
+                    channel_idx++;
+                }
+                Serial.println();
+            } else if (memcmp(method, "msg ", 4) == 0) {
+                const char* cdata = &method[4];
+                std::vector<String> parts = split(cdata, 2);
+                // 0 = channel_id
+                // 1 = message
+
+                if (parts.size() < 2) { // value can be optional
+                    Serial.println("  ERROR: Not enough params");
+                } else {
+                    int id = parts.at(0).toInt();
+                    ChannelDetails ch;
+                    if (getChannel(id, ch)) {
+                        Serial.printf("  Send to: [%u]", id);
+                        Serial.println(ch.name);
+                        Serial.print("msg: ");
+                        Serial.println(parts[1]);
+                        sendChannelMsg(parts[1].c_str(), 0, ch.channel);
+                    } else {
+                        Serial.println("  ERROR: Invalid channel");
+                    }
+                }
+            }
+        } else if (memcmp(command, "set ", 4) == 0) {
+            const char* config = &command[4];
+            if (memcmp(config, "af ", 3) == 0) {
+                _prefs.airtime_factor = atof(&config[3]);
+                savePrefs();
+                Serial.println("  OK");
+            } else if (memcmp(config, "name ", 5) == 0) {
+                StrHelper::strncpy(_prefs.node_name, &config[5], sizeof(_prefs.node_name));
+                savePrefs();
+                Serial.println("  OK");
+            } else if (memcmp(config, "lat ", 4) == 0) {
+                _prefs.node_lat = atof(&config[4]);
+                savePrefs();
+                Serial.println("  OK");
+            } else if (memcmp(config, "lon ", 4) == 0) {
+                _prefs.node_lon = atof(&config[4]);
+                savePrefs();
+                Serial.println("  OK");
+            } else if (memcmp(config, "tx ", 3) == 0) {
+                _prefs.tx_power_dbm = atoi(&config[3]);
+                savePrefs();
+                Serial.println("  OK - reboot to apply");
+            } else if (memcmp(config, "freq ", 5) == 0) {
+                _prefs.freq = atof(&config[5]);
+                savePrefs();
+                Serial.println("  OK - reboot to apply");
+            } else if (memcmp(config, "path.hash.mode ", 15) == 0) {
+                _prefs.path_hash_mode = atoi(&config[15]);
+                savePrefs();
+                Serial.println("  OK");
+            } else {
+                Serial.printf("  ERROR: unknown config: %s\n", config);
+            }
+        } else if (memcmp(command, "ver", 3) == 0) {
+            Serial.println("logger:   " LOGGER_VER_TEXT);
+            Serial.println("meshcore: " FIRMWARE_VER_TEXT);
+            Serial.println("date:     " BUILD_DATE);
+        } else if (memcmp(command, "wifi ", 5) == 0) {
+            const char* config = &command[5];
+            if (memcmp(config, "ssid ", 5) == 0) {
+                StrHelper::strncpy(_wifi.ssid, &config[5], sizeof(_wifi.ssid));
+                saveWiFiPrefs();
+                Serial.println("  OK");
+            } else if (memcmp(config, "password ", 9) == 0) {
+                StrHelper::strncpy(_wifi.password, &config[9], sizeof(_wifi.password));
+                saveWiFiPrefs();
+                Serial.println("  OK");
+            } else if (memcmp(config, "tx ", 3) == 0) {
+                float f = atof(&config[3]);
+                if (f < 2.0 || f > 21.0) {
+                Serial.println("Invalid value. Must be in range 2 .. 21");
+                } else {
+                // txval should be in range [8, 84]
+                int txval = f * 4;
+                _wifi.txpower = txval;
+                saveWiFiPrefs();
+                }
+            } else {
+                String status = "";
+                int wstatus = WiFi.status();
+                switch (wstatus) {
+                case WL_IDLE_STATUS:     status = "Idle"; break;
+                case WL_NO_SSID_AVAIL:   status = "No SSID Available"; break;
+                case WL_SCAN_COMPLETED:  status = "Scan Completed"; break;
+                case WL_CONNECTED:       status = "Connected"; break;
+                case WL_CONNECT_FAILED:  status = "Connection Failed"; break;
+                case WL_CONNECTION_LOST: status = "Connection Lost"; break;
+                case WL_DISCONNECTED:    status = "Disconnected"; break;
+                default:                 status = "Unknown"; break;
+                }
+
+                Serial.printf("  WiFi Status: %s (%u)\n", status.c_str(), wstatus);
+                Serial.printf("  WiFi Config:\n");
+                Serial.printf("    Version:   %u\n", _wifi.version);
+                Serial.printf("    SSID:      %s\n", _wifi.ssid);
+                Serial.printf("    Tx Power:  %.2f\n", _wifi.txpower / 4.0);
+                Serial.println();
+            }
+        } else if (memcmp(command, "log ", 4) == 0) {
+        const char* config = &command[4];
+            if (memcmp(config, "url ", 4) == 0) {
+                StrHelper::strncpy(_logp.url, &config[4], sizeof(_logp.url));
+                saveLogPrefs();
+                Serial.println("  OK");
+            } else if (memcmp(config, "auth ", 5) == 0) {
+                StrHelper::strncpy(_logp.auth, &config[5], sizeof(_logp.auth));
+                saveLogPrefs();
+                Serial.println("  OK");
+            } else if (memcmp(config, "report ", 7) == 0) {
+                _logp.selfreport = atoi(&config[7]);
+                if (_logp.selfreport != 0 && _logp.selfreport < CONFIG_MIN_SELFREPORT_INTERVAL) {
+                    _logp.selfreport = CONFIG_MIN_SELFREPORT_INTERVAL;
+                }
+                saveLogPrefs();
+                Serial.println("  OK");
+            } else if (memcmp(config, "raw ", 4) == 0) {
+                if (config[4] == 'y') {
+                _logp.doraw = 1;
+                } else {
+                _logp.doraw = 0;
+                }
+                saveLogPrefs();
+                Serial.println("  OK");
+            } else if (memcmp(config, "usbraw ", 7) == 0) {
+                if (config[7] == 'y') {
+                _logp.usbraw = 1;
+                } else {
+                _logp.usbraw = 0;
+                }
+                saveLogPrefs();
+                Serial.println("  OK");
+            } else if (memcmp(config, "fwd ", 4) == 0) {
+                if (config[4] == 'y') {
+                _logp.dofwd = 1;
+                } else {
+                _logp.dofwd = 0;
+                }
+                saveLogPrefs();
+                Serial.println("  OK");
+            } else if (memcmp(config, "web ", 4) == 0) {
+                if (config[4] == 'y' || config[4] == '1') {
+                Serial.println("Website enabled");
+                _logp.web = 1;
+                } else {
+                Serial.println("Website disabled");
+                _logp.web = 0;
+                }
+                Serial.println("Reboot to apply");
+                saveLogPrefs();
+                Serial.println("  OK");
+            } else {
+                char sender[(PUB_KEY_SIZE * 2) + 1];
+                mesh::Utils::toHex(sender, self_id.pub_key, PUB_KEY_SIZE);
+                Serial.printf("  Log url:     %s\n", _logp.url);
+                Serial.printf("  Self-report: %u\n", _logp.selfreport);
+                Serial.printf("  Pub Key:     %s\n", sender);
+                Serial.printf("  Raw:         %u\n", _logp.doraw);
+                Serial.printf("  Fwd:         %u\n", _logp.dofwd);
+                Serial.printf("  Web:         %u\n", _logp.web);
+                Serial.printf("  USB Raw      %u\n", _logp.usbraw);
+            }
+        } else if (memcmp(command, "debug ", 6) == 0) {
+            if (command[6] == 'y') {
+                m_debugPrint = true;
+            } else {
+                m_debugPrint = false;
+            }
+            Serial.printf("  Debug print: %u\n", m_debugPrint);
+        } else if (memcmp(command, "regeneratekey", 13) == 0) {
+            IdentityStore store(*_fs, "/identity");
+            Serial.println("generating key...");
+            ((StdRNG *)getRNG())->begin(millis());
+
+            self_id = mesh::LocalIdentity(getRNG());  // create new random identity
+            int count = 0;
+            while (count < 10 && (self_id.pub_key[0] == 0x00 || self_id.pub_key[0] == 0xFF)) {  // reserved id hashes
+                self_id = mesh::LocalIdentity(getRNG()); count++;
+            }
+            Serial.println("done.");
+            store.save("_main", self_id);
+        } else if (memcmp(command, "reboot", 6) == 0) {
+            Serial.println("Rebooting...");
+            ESP.restart();
+        } else if (memcmp(command, "start ota", 9) == 0) {
+#ifndef WEBSERVER_OTA_ENABLE
+            Serial.println("OTA not supported");
+#else
+            char id[160];
+            sprintf(id, "MeshCore Logger (%s %s)", __DATE__, __TIME__);
+            AsyncWebServer* server = new AsyncWebServer(80);
+            AsyncElegantOTA.setID(id);
+            AsyncElegantOTA.begin(server);    // Start ElegantOTA
+            server->begin();
+            Serial.print("  Go to http://");
+            Serial.print(WiFi.localIP());
+            Serial.println("/update");
+#endif
+        } else if (memcmp(command, "tel ", 4) == 0) {
+            const char* action = &command[4];
+            if (memcmp(action, "ls", 2) == 0) {
+                uint32_t now = getRTCClock()->getCurrentTime();
+                Serial.println("ID | Name                 | Pub Key        | Path          | Start | Interval | Next     | L | Password");
+                for (int i=0; i<_telemetry.rules.size(); i++) {
+                    TelemetryRule* rule = _telemetry.rules[i];
+
+                    // id
+                    Serial.printf("%2d | ", i);
+
+                    // name
+                    ContactInfo* c = lookupContactByPubKey(rule->pubkey, rule->key_len);
+                    if (c) {
+                        char uname[32];
+                        int k = 0;
+                        for (int j=0;j<32;j++) {
+                            uname[k] = 0;
+                            char b = c->name[j];
+                            if (b == 0) {
+                                break;
+                            } else if (b >= 32 && b <= 127) {
+                                uname[k++] = b;
+                            }
+                        }
+                        Serial.printf("%-20.20s | ", uname);
+                    } else {
+                        Serial.print("_unknown_ | ");
+                    }
+
+                    // key
+                    for (int j=0;j<4;j++) {
+                        if (j < rule->key_len) {
+                            Serial.printf("%02X:", rule->pubkey[j]);
+                        } else {
+                            Serial.print("--:");
+                        }
+                    }
+                    Serial.print(".. | ");
+
+                    // path
+                    if (rule->path_len == -1) {
+                        Serial.print("Flood         | ");
+                    } else {
+                        for (int j = 0; j < 4; j++) {
+                            if (j > 0) Serial.print(j < rule->path_len ? ',' : ' ');
+                            if (j < rule->path_len)
+                                Serial.printf("%02X", rule->path[j]);
+                            else
+                                Serial.print("  ");
+                        }
+
+                        if (rule->path_len == 5) {
+                            Serial.printf(",%02X", rule->path[4]);
+                        } else if (rule->path_len > 5) {
+                            Serial.print(".. | ");
+                        } else {
+                            Serial.print("   | ");
+                        }
+                    }
+
+                    // timing
+                    uint32_t eta =  rule->next - now;
+                    Serial.printf("%-5d | %-8d | %-8d | %c | %s\n",
+                        rule->start,
+                        rule->interval,
+                        eta,
+                        rule->loggedin ? 'Y' : 'n',
+                        rule->password
+                    );
+                }
+            } else if (memcmp(action, "run ", 4) == 0) {
+                const char* idstr = &action[4];
+                int id = atoi(idstr);
+                telemetryRun(id);
+            } else if (memcmp(action, "schedule ", 9) == 0) {
+                const char* idstr = &action[9];
+                int id = atoi(idstr);
+                telemetryRun(id, true, true);
+            } else if (memcmp(action, "cancel", 6) == 0) {
+                cancelTelemetry();
+            } else if (memcmp(action, "runp ", 5) == 0) {
+                const char* idstr = &action[5];
+                int id = atoi(idstr);
+                telemetryRun(id, false);
+            } else if (memcmp(action, "logout ", 7) == 0) {
+                const char* idstr = &action[7];
+                int id = atoi(idstr);
+                if (id >= _telemetry.rules.size()) {
+                    Serial.println("  ERROR: Bad ID");
+                } else {
+                    _telemetry.rules[id]->loggedin = false;
+                }
+            } else if (memcmp(action, "rm ", 3) == 0) {
+                const char* idstr = &action[3];
+                int id = atoi(idstr);
+                if (id >= _telemetry.rules.size()) {
+                    Serial.println("  ERROR: Bad ID");
+                } else {
+                    _telemetry.rules.erase(_telemetry.rules.begin() + id);
+                }
+            } else if (memcmp(action, "set ", 4) == 0) {
+                const char* cdata = &action[4];
+
+                std::vector<String> parts = split(cdata, 0);
+                // 0 = param
+                // 1 = id
+                // 2 = value
+
+                if (parts.size() < 2) { // value can be optional
+                    Serial.println("  ERROR: Not enough params");
+                } else {
+                    int id = parts.at(1).toInt();
+                    if (id < 0 || id > (_telemetry.rules.size() - 1)) {
+                        Serial.printf("  ERROR: bad id (%d). Expected [0 .. %d]\n",
+                            id,
+                            _telemetry.rules.size()
+                        );
+                    } else {
+                        TelemetryRule* rule = _telemetry.rules[id];
+                        if (parts[0] == "password") {
+                            memset(rule->password, 0, sizeof(rule->password));
+                            if (parts.size() > 2) {
+                                strncpy(rule->password, parts.at(2).c_str(), sizeof(rule->password));
+                            }
+                        } else if (parts[0] == "start") {
+                            if (parts.size() > 2) {
+                                rule->start = parts.at(2).toInt();
+                                rule->next = 0;
+                            } else {
+                                Serial.println("  ERROR: Missing value");
+                            }
+                        } else if (parts[0] == "interval") {
+                            if (parts.size() > 2) {
+                                rule->interval = parts.at(2).toInt();
+                                if (rule->interval < TELEMETRY_MIN_INTERVAL) {
+                                rule->interval = TELEMETRY_MIN_INTERVAL;
+                                }
+                                rule->next = 0;
+                            } else {
+                                Serial.println("  ERROR: Missing value");
+                            }
+                        } else if (parts[0] == "path") {
+                            // TODO: how to mark flood/dir? Path len could be -1 for flood
+                            memset(rule->path, 0, MAX_PATH_SIZE);
+                            rule->path_len = 0;
+
+                            if (parts.size() > 2) {
+                                String value = parts.at(2);
+                                if (value == "flood") {
+                                    rule->path_len = -1;
+                                } else {
+                                    char buf[value.length() + 1];
+                                    value.toCharArray(buf, sizeof(buf));
+
+                                    char *pch = strtok(buf," ,.-:");
+                                    while (pch != NULL) {
+                                        rule->path[rule->path_len++] = strtol(pch, NULL, 16);
+                                        pch = strtok (NULL, " ,.-:");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (memcmp(action, "add ", 4) == 0) {
+                if (_telemetry.rules.size() < TELEMETRY_MAX_RULES) {
+                const char* pubkey = &action[4];
+                int len = strlen(pubkey);
+                len >>= 1;
+
+                if (len >= 2) {
+                    uint8_t raw[PUB_KEY_SIZE];
+                    if (mesh::Utils::fromHex(raw, len, pubkey)) {
+                    int offset = (_telemetry.rules.size() * 180) + random(0, 60); // 3 minutes + up to 1 minute
+                    TelemetryRule* rule = new TelemetryRule();
+                    memcpy(rule->pubkey, raw, len);
+                    rule->key_len = len;
+                    rule->path_len = -1;
+                    rule->password[0] = 0; // no password
+                    rule->start = 7200 + offset; // 02:00
+                    rule->interval = 86400; // 1 day
+                    rule->next = 0;
+                    _telemetry.rules.push_back(rule);
+                    } else {
+                        Serial.println("  ERROR: Bad pubkey");
+                    }
+                } else {
+                    Serial.println("  ERROR: Enter at least 2 bytes");
+                }
+                } else {
+                    Serial.println("  ERROR: Max count readched");
+                }
+            } else if (memcmp(action, "rld", 3) == 0) {
+                Serial.println("  Reload telemetry");
+                loadTelemetryRules();
+            } else if (memcmp(action, "save", 4) == 0) {
+                Serial.println("  Save telemetry");
+                saveTelemetryRules();
+            } else {
+                Serial.println("  Unknown anction. Valid options are:");
+                Serial.println("     ls");
+                Serial.println("     add {pubkey}  # can be first few bytes");
+                Serial.println("     set start|interval|password {id} {value}  # find id by `ls`");
+                Serial.println("     rm {id}");
+            }
+        } else if (memcmp(command, "contacts ", 9) == 0) {
+            const char* action = &command[9];
+            if (memcmp(action, "ls", 2) == 0) {
+                ContactsIterator iter;
+                ContactInfo c;
+                int i = 0;
+
+                uint32_t curr = getRTCClock()->getCurrentTime();
+
+                Serial.println("ID | Name                s | Pub Key        | Type | Last mod");
+                while (iter.hasNext(this, c)) {
+                Serial.printf("%2d | ", i);
+                i++;
+
+                Serial.printf("%-20.20s | ", c.name);
+
+                for (int j=0;j<4;j++) {
+                    Serial.printf("%02X:", c.id.pub_key[j]);
+                }
+
+                Serial.print(".. | ");
+
+                if (c.type == ADV_TYPE_NONE) {
+                    Serial.print("None");
+                } else if (c.type == ADV_TYPE_CHAT) {
+                    Serial.print("Chat");
+                } else if (c.type == ADV_TYPE_REPEATER) {
+                    Serial.print("Rept");
+                } else if (c.type == ADV_TYPE_ROOM) {
+                    Serial.print("Room");
+                } else if (c.type == ADV_TYPE_SENSOR) {
+                    Serial.print("Sens");
+                } else {
+                    Serial.print("unkn");
+                }
+
+                Serial.print(" | ");
+
+                char tmp[40];
+                int32_t secs = c.lastmod;;
+                AdvertTimeHelper::formatRelativeTimeDiff(tmp, secs, false);
+                Serial.println(secs);
+
+                }
+            } else if (memcmp(action, "rm", 2) == 0) {
+                const char* idstr = &action[3];
+                int id = atoi(idstr);
+
+                ContactsIterator iter;
+                ContactInfo c;
+                int i = 0;
+
+                while (iter.hasNext(this, c)) {
+                if (i++ == id) {
+                    Serial.println("Removed contact ");
+                    Serial.print(c.name);
+                    Serial.print(" (");
+                    for (int j=0;j<4;j++) {
+                        Serial.printf("%02X:", c.id.pub_key[j]);
+                    }
+                    Serial.println("..)");
+                    removeContact(c);
+                    break;
+                }
+                }
+            } else if (memcmp(action, "save", 4) == 0) {
+                saveContacts();
+                Serial.println("Contacts saved");
+            } else if (memcmp(action, "msg ", 4) == 0) {
+                const char* cdata = &action[4];
+                std::vector<String> parts = split(cdata, 2);
+                // 0 = contact_id
+                // 1 = message
+
+                if (parts.size() < 2) { // value can be optional
+                    Serial.println("  ERROR: Not enough params");
+                } else {
+                    int id = parts.at(0).toInt();
+
+                    ContactInfo c;
+                    if (!getContactByIdx(id, c)) {
+                        Serial.println("  ERROR: Bad contact ID");
+                    } else {
+                        // send message
+                        String text = parts.at(1);
+                        uint32_t est_timeout;
+
+                        int result = sendMessage(c, getRTCClock()->getCurrentTime(), 0, parts.at(1).c_str(), expected_ack_crc, est_timeout);
+                        if (result == MSG_SEND_FAILED) {
+                            Serial.println("   ERROR: unable to send.");
+                        } else {
+                            last_msg_sent = _ms->getMillis();
+                            Serial.printf("   (message sent - %s)\n", result == MSG_SEND_SENT_FLOOD ? "FLOOD" : "DIRECT");
+                        }
+                    }
+                }
+            }
+        } else if (memcmp(command, "dbg", 3) == 0) {
+            dbg = !dbg;
+            Serial.print("  Debug ");
+            Serial.println(dbg ? "ON" : "OFF");
+        } else if (memcmp(command, "help", 4) == 0) {
+            Serial.println("Commands:");
+            Serial.println("   set {name|lat|lon|freq|tx|af} {value}");
+            Serial.println("   card");
+            Serial.println("   import {biz card}");
+            Serial.println("   clock");
+            Serial.println("   time {epoch-seconds|ntp}>");
+            Serial.println("   list {n}");
+            Serial.println("   to <recipient name or prefix>");
+            Serial.println("   to");
+            Serial.println("   send <text>");
+            Serial.println("   advert");
+            Serial.println("   flood");
+            Serial.println("   reset path");
+            Serial.println("   public <text>");
+            Serial.println();
+            Serial.println(" - Logger:");
+            Serial.println("   wifi {ssid|password} {value}");
+            Serial.println("   log {url|auth|report|raw} {value}");
+            Serial.println("   channel {add|ls} {value}");
+        #ifdef WEBSERVER_OTA_ENABLE
+            Serial.println("   start ota");
+        #endif
+            Serial.println();
+            Serial.println(" - Telemetry:");
+            Serial.println("   tel ls");
+            Serial.println("   tel add {pubkey}");
+            Serial.println("   tel rm {id}");
+            Serial.println("   tel set {path|start|interval|password} {id} {value}");
+            Serial.println("   tel run {id}");
+            Serial.println("   tel cancel");
+            Serial.println("   tel save");
+            Serial.println();
+            Serial.println(" - Contacts:");
+            Serial.println("   contacts ls");
+            Serial.println("   contacts rm {id}");
+            Serial.println("   contacts save");
+        } else {
+            Serial.print("   ERROR: unknown command: "); Serial.println(command);
+        }
+    }
+
+    void loop() {
+        BaseChatMesh::loop();
+        getRTCClock()->tick();
+        telemetryLoop();
+
+        int len = strlen(command);
+        while (Serial.available() && len < sizeof(command)-1) {
+        char c = Serial.read();
+        if (c == 0x08) { // backspace
+            if (len > 0) {
+            command[len - 1] = 0;
+            len--;
+            Serial.print(c);
+            Serial.print(' ');
+            }
+        } else if (c != '\n') {
+            command[len++] = c;
+            command[len] = 0;
+        }
+            Serial.print(c);
+        }
+        if (len == sizeof(command)-1) {  // command buffer full
+            command[sizeof(command)-1] = '\r';
+        }
+
+        if (len > 0 && command[len - 1] == '\r') {  // received complete line
+            command[len - 1] = 0;  // replace newline with C string null terminator
+
+            handleCommand(command);
+            command[0] = 0;  // reset command buffer
+        }
+    }
+};
