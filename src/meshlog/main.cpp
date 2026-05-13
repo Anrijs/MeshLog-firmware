@@ -16,10 +16,14 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
-#ifndef DISABLE_WIFI_OTA
-#include <AsyncElegantOTA.h>
+#ifdef WEBSERVER_ENABLE
+  #include <AsyncTCP.h>
+  #include <ESPAsyncWebServer.h>
+  #ifdef WEBSERVER_OTA_ENABLE
+    #include <AsyncElegantOTA.h>
+  #endif
+#else
+  #undef WEBSERVER_OTA_ENABLE
 #endif
 
 #include <helpers/ArduinoHelpers.h>
@@ -40,26 +44,6 @@
 #define LOGGER_VER_TEXT "v1.3.1"
 #define BUILD_DATE __DATE__ " " __TIME__
 #define FULL_VER_TEXT "fw: " FIRMWARE_VER_TEXT ", logger: " LOGGER_VER_TEXT ", build-time: " BUILD_DATE
-
-#ifndef LORA_FREQ
-  #define LORA_FREQ   915.0
-#endif
-#ifndef LORA_BW
-  #define LORA_BW     250
-#endif
-#ifndef LORA_SF
-  #define LORA_SF     10
-#endif
-#ifndef LORA_CR
-  #define LORA_CR      5
-#endif
-#ifndef LORA_TX_POWER
-  #define LORA_TX_POWER  20
-#endif
-
-#ifndef MAX_CONTACTS
-  #define MAX_CONTACTS         300
-#endif
 
 #define MAX_LOG_QUEUE_SIZE  32
 
@@ -95,9 +79,12 @@ void WiFiTaskCode(void* pvParameters);
 void MeshTaskCode(void* pvParameters);
 
 // Web
+#ifdef WEBSERVER_ENABLE
 void setupWebserver();
 static AsyncWebServer server(80);
 static AsyncWebSocket ws("/ws");
+#endif
+
 static bool dbg = false;
 
 void logSystem(String tag);
@@ -962,7 +949,9 @@ protected:
     doc2["data"] = doc;
     doc2["data"]["cid"] = contactId;
     serializeJson(doc2, msgData);
+#ifdef WEBSERVER_ENABLE
     ws.printfAll(msgData.c_str());
+#endif
   }
 
   void onCommandDataRecv(const ContactInfo& from, mesh::Packet* pkt, uint32_t sender_timestamp, const char *text) override {
@@ -1029,8 +1018,9 @@ protected:
     String msgData;
     serializeJson(doc2, msgData);
     addHistory(msgData);
+#ifdef WEBSERVER_ENABLE
     ws.printfAll(msgData.c_str());
-
+#endif
     // Slash commands
     // Dont run in public
     if (channel.hash[0] == 0x11) return;
@@ -1187,7 +1177,9 @@ protected:
       doc2["data"]["m"] = output;
       doc2["data"]["n"] = name;
       serializeJson(doc2, msgData);
+#ifdef WEBSERVER_ENABLE
       ws.printfAll(msgData.c_str());
+#endif
     }
   }
 
@@ -1247,8 +1239,9 @@ protected:
         doc2["data"]["m"] = "Telemetry read timed out";
         doc2["data"]["n"] = curr_telemetry->name;
         serializeJson(doc2, msgData);
+#ifdef WEBSERVER_ENABLE
         ws.printfAll(msgData.c_str());
-
+#endif
         cancelTelemetry();
       }
       return;
@@ -1590,7 +1583,9 @@ public:
         String msgData;
         serializeJson(doc2, msgData);
         addHistory(msgData);
+#ifdef WEBSERVER_ENABLE
         ws.printfAll(msgData.c_str());
+#endif
       } else {
         Serial.println("   ERROR: unable to send");
       }
@@ -1942,7 +1937,7 @@ public:
       Serial.println("Rebooting...");
       ESP.restart();
     } else if (memcmp(command, "start ota", 9) == 0) {
-#ifdef DISABLE_WIFI_OTA
+#ifndef WEBSERVER_OTA_ENABLE
       Serial.println("OTA not supported");
 #else
       char id[160];
@@ -2283,7 +2278,7 @@ public:
       Serial.println("   wifi {ssid|password} {value}");
       Serial.println("   log {url|auth|report|raw} {value}");
       Serial.println("   channel {add|ls} {value}");
-#ifndef DISABLE_WIFI_OTA
+#ifdef WEBSERVER_OTA_ENABLE
       Serial.println("   start ota");
 #endif
       Serial.println();
@@ -2491,6 +2486,7 @@ void WiFiTaskCode(void * pvParameters) {
         }
       }
 
+#ifdef WEBSERVER_ENABLED
       if (webserver) {
         ws.cleanupClients(5); 
       } else if (!webserver && the_mesh.getLogPrefs()->web) {
@@ -2498,6 +2494,7 @@ void WiFiTaskCode(void * pvParameters) {
         setupWebserver();
         webserver = true;
       }
+#endif
     } else if (connected && (millis() > (lastConencted + 5000) || sendFailures > 5)) {
       WiFi.disconnect();
       connected = false;
@@ -2567,6 +2564,7 @@ void startMeshTask(int core) {
 }
 
 void setupWebserver() {
+#ifdef WEBSERVER_ENABLE
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/html", htmlChat);
   });
@@ -2748,6 +2746,7 @@ void setupWebserver() {
   server.addHandler(&ws);
 
   server.begin();
+#endif
 }
 
 void setup() {
