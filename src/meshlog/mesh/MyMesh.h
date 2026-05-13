@@ -117,13 +117,6 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
     bool rawDecoded = false;
     bool ntpSynced = false;
 
-    const char* getTypeName(uint8_t type) const {
-        if (type == ADV_TYPE_CHAT) return "Chat";
-        if (type == ADV_TYPE_REPEATER) return "Repeater";
-        if (type == ADV_TYPE_ROOM) return "Room";
-        return "??";  // unknown
-    }
-
     void loadContacts() {
         if (_fs->exists("/contacts")) {
             File file = _fs->open("/contacts");
@@ -416,29 +409,6 @@ public:
     const bool debugPrint() { return m_debugPrint; }
     const bool isNtpSynced() { return ntpSynced; }
     void setNtpSynced(bool syn) { ntpSynced = syn; }
-
-private:
-    void importCard(const char* command) {
-        while (*command == ' ') command++;   // skip leading spaces
-        if (memcmp(command, "meshcore://", 11) == 0) {
-            command += 11;  // skip the prefix
-            char *ep = strchr(command, 0);  // find end of string
-            while (ep > command) {
-                ep--;
-                if (mesh::Utils::isHexChar(*ep)) break;  // found tail end of card
-                *ep = 0;  // remove trailing spaces and other junk
-            }
-            int len = strlen(command);
-            if (len % 2 == 0) {
-                len >>= 1;  // halve, for num bytes
-                if (mesh::Utils::fromHex(tmp_buf, len, command)) {
-                    importContact(tmp_buf, len);
-                    return;
-                }
-            }
-        }
-        Serial.println("   error: invalid format");
-    }
 
 protected:
     float getAirtimeBudgetFactor() const override {
@@ -2086,7 +2056,6 @@ public:
             Serial.println("Commands:");
             Serial.println("   set {name|lat|lon|freq|tx|af} {value}");
             Serial.println("   card");
-            Serial.println("   import {biz card}");
             Serial.println("   clock");
             Serial.println("   time {epoch-seconds|ntp}>");
             Serial.println("   list {n}");
