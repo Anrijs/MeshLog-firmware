@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <esp_task_wdt.h>
 
 #ifndef ESP32
 #error "Platform not supported."
@@ -270,228 +271,245 @@ void startWifiTask(int core) {
         NULL,           /* parameter of the task */
         1,              /* priority of the task */
         &WiFiTask,      /* Task handle to keep track of created task */
-        core);          /* pin task to core */
-    }
+        core            /* pin task to core */
+    );
+}
+
+void startMeshTask(int core) {
+    xTaskCreatePinnedToCore(
+        MeshTaskCode,   /* Task function. */
+        "MeshTask",     /* name of task. */
+        10000,          /* Stack size of task */
+        NULL,           /* parameter of the task */
+        1,              /* priority of the task */
+        &MeshTask,      /* Task handle to keep track of created task */
+        core            /* pin task to core */
+    );
+}
+
+void setupWebserver() {
+    #ifdef WEBSERVER_ENABLE
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/html", htmlChat);
+    });
     
-    void startMeshTask(int core) {
-        xTaskCreatePinnedToCore(
-            MeshTaskCode,   /* Task function. */
-            "MeshTask",     /* name of task. */
-            10000,          /* Stack size of task */
-            NULL,           /* parameter of the task */
-            1,              /* priority of the task */
-            &MeshTask,      /* Task handle to keep track of created task */
-            core);          /* pin task to core */
+    server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/html", htmlSettings);
+    });
+    
+    server.on("/chat.json", HTTP_GET, [](AsyncWebServerRequest *request) {
+        JsonDocument doc;
+        doc["name"] = the_mesh.getNodePrefs()->node_name;
+        JsonArray arr = doc["msg"].to<JsonArray>();
+        
+        int size = the_mesh.getHistorySize();
+        for (int i=0;i<size;i++) {
+            JsonDocument doc2;
+            DeserializationError error = deserializeJson(doc2, the_mesh.getHistory(i));
+            if (error) continue;
+            arr.add(doc2);
         }
         
-        void setupWebserver() {
-            #ifdef WEBSERVER_ENABLE
-            server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-                request->send(200, "text/html", htmlChat);
-            });
+        String postData;
+        serializeJson(doc, postData);
+        
+        request->send(200, "application/json", postData);
+    });
+    
+    server.on("/settings.json", HTTP_GET, [](AsyncWebServerRequest *request) {
+        JsonDocument doc;
+        doc["node_prefs"]["node_name"] = the_mesh.getNodePrefs()->node_name;
+        doc["node_prefs"]["node_lat"] = the_mesh.getNodePrefs()->node_lat;
+        doc["node_prefs"]["node_lon"] = the_mesh.getNodePrefs()->node_lon;
+        doc["node_prefs"]["freq"] = the_mesh.getNodePrefs()->freq;
+        doc["node_prefs"]["tx_power_dbm"] = the_mesh.getNodePrefs()->tx_power_dbm;
+        doc["node_prefs"]["hash_mode"] = the_mesh.getNodePrefs()->path_hash_mode;
+        
+        doc["wifi_prefs"]["ssid"] = the_mesh.getWiFiPrefs()->ssid;
+        doc["wifi_prefs"]["password"] = the_mesh.getWiFiPrefs()->password;
+        doc["wifi_prefs"]["txpower"] = the_mesh.getWiFiPrefs()->txpower / 4.0;
+        
+        doc["logger_prefs"]["url"] = the_mesh.getLogPrefs()->url;
+        doc["logger_prefs"]["auth"] = the_mesh.getLogPrefs()->auth;
+        doc["logger_prefs"]["selfreport"] = the_mesh.getLogPrefs()->selfreport;
+        
+        String postData;
+        serializeJson(doc, postData);
+        
+        request->send(200, "application/json", postData);
+    });
+    
+    server.on("/contacts.json", HTTP_GET, [](AsyncWebServerRequest *request) {
+        JsonDocument doc;
+        JsonArray arr = doc["contacts"].to<JsonArray>();
+        
+        ContactsIterator iter;
+        ContactInfo c;
+        int i = 0;
+        
+        while (iter.hasNext(&the_mesh, c)) {
+            JsonDocument obj;
+            obj["id"] = i++;
             
-            server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request) {
-                request->send(200, "text/html", htmlSettings);
-            });
+            String tmp = "";
+            for (int j=0;j<PUB_KEY_SIZE;j++) {
+                if (j > 0) tmp += ':';
+                if (c.id.pub_key[j] < 0x10) tmp += '0';
+                tmp += String(c.id.pub_key[j], HEX);
+            }
+            obj["pk"] = tmp;
+            obj["n"] = c.name;
+            obj["t"] = c.type;
+            obj["m"] = c.lastmod;
+            obj["s"] = c.sync_since;
+            obj["a"] = c.last_advert_timestamp;
             
-            server.on("/chat.json", HTTP_GET, [](AsyncWebServerRequest *request) {
-                JsonDocument doc;
-                doc["name"] = the_mesh.getNodePrefs()->node_name;
-                JsonArray arr = doc["msg"].to<JsonArray>();
-                
-                int size = the_mesh.getHistorySize();
-                for (int i=0;i<size;i++) {
-                    JsonDocument doc2;
-                    DeserializationError error = deserializeJson(doc2, the_mesh.getHistory(i));
-                    if (error) continue;
-                    arr.add(doc2);
-                }
-                
-                String postData;
-                serializeJson(doc, postData);
-                
-                request->send(200, "application/json", postData);
-            });
-            
-            server.on("/settings.json", HTTP_GET, [](AsyncWebServerRequest *request) {
-                JsonDocument doc;
-                doc["node_prefs"]["node_name"] = the_mesh.getNodePrefs()->node_name;
-                doc["node_prefs"]["node_lat"] = the_mesh.getNodePrefs()->node_lat;
-                doc["node_prefs"]["node_lon"] = the_mesh.getNodePrefs()->node_lon;
-                doc["node_prefs"]["freq"] = the_mesh.getNodePrefs()->freq;
-                doc["node_prefs"]["tx_power_dbm"] = the_mesh.getNodePrefs()->tx_power_dbm;
-                doc["node_prefs"]["hash_mode"] = the_mesh.getNodePrefs()->path_hash_mode;
-                
-                doc["wifi_prefs"]["ssid"] = the_mesh.getWiFiPrefs()->ssid;
-                doc["wifi_prefs"]["password"] = the_mesh.getWiFiPrefs()->password;
-                doc["wifi_prefs"]["txpower"] = the_mesh.getWiFiPrefs()->txpower / 4.0;
-                
-                doc["logger_prefs"]["url"] = the_mesh.getLogPrefs()->url;
-                doc["logger_prefs"]["auth"] = the_mesh.getLogPrefs()->auth;
-                doc["logger_prefs"]["selfreport"] = the_mesh.getLogPrefs()->selfreport;
-                
-                String postData;
-                serializeJson(doc, postData);
-                
-                request->send(200, "application/json", postData);
-            });
-            
-            server.on("/contacts.json", HTTP_GET, [](AsyncWebServerRequest *request) {
-                JsonDocument doc;
-                JsonArray arr = doc["contacts"].to<JsonArray>();
-                
-                ContactsIterator iter;
-                ContactInfo c;
-                int i = 0;
-                
-                while (iter.hasNext(&the_mesh, c)) {
-                    JsonDocument obj;
-                    obj["id"] = i++;
-                    
-                    String tmp = "";
-                    for (int j=0;j<PUB_KEY_SIZE;j++) {
-                        if (j > 0) tmp += ':';
-                        if (c.id.pub_key[j] < 0x10) tmp += '0';
-                        tmp += String(c.id.pub_key[j], HEX);
-                    }
-                    obj["pk"] = tmp;
-                    obj["n"] = c.name;
-                    obj["t"] = c.type;
-                    obj["m"] = c.lastmod;
-                    obj["s"] = c.sync_since;
-                    obj["a"] = c.last_advert_timestamp;
-                    
-                    arr.add(obj);
-                }
-                
-                String postData;
-                serializeJson(doc, postData);
-                
-                request->send(200, "application/json", postData);
-            });
-            
-            server.on("/telemetry.json", HTTP_GET, [](AsyncWebServerRequest *request) {
-                JsonDocument doc;
-                JsonArray arr = doc["telemetry"].to<JsonArray>();
-                
-                const TelemetryRules* tel = the_mesh.getTelemetryRules();
-                
-                for (int i=0; i<tel->rules.size(); i++) {
-                    JsonDocument obj;
-                    obj["id"] = i;
-                    
-                    TelemetryRule* rule = tel->rules[i];
-                    ContactInfo* c = the_mesh.lookupContactByPubKey(rule->pubkey, rule->key_len);
-                    
-                    String tmp = "";
-                    for (int j=0;j<rule->key_len && j < PUB_KEY_SIZE;j++) {
-                        if (j > 0) tmp += ':';
-                        if (rule->pubkey[j] < 0x10) tmp += '0';
-                        tmp += String(rule->pubkey[j], HEX);
-                    }
-                    obj["pk"] = tmp;
-                    
-                    tmp = "";
-                    if (rule->path_len == -1) {
-                        tmp = "Flood";
-                    } else {
-                        for (int j=0;j<rule->path_len && j<MAX_PATH_SIZE;j++) {
-                            if (j > 0) tmp += ',';
-                            if (rule->path[j] < 0x10) tmp += '0';
-                            tmp += String(rule->path[j], HEX);
-                        }
-                    }
-                    obj["path"] = tmp;
-                    obj["password"] = rule->password;
-                    obj["start"] = rule->start;
-                    obj["interval"] = rule->interval;
-                    obj["next"] = rule->next;
-                    obj["loggedin"] = rule->loggedin;
-                    
-                    if (c) {
-                        obj["name"] = c->name;
-                    } else {
-                        obj["name"] = "unknown";
-                    }
-                    arr.add(obj);
-                }
-                
-                String postData;
-                serializeJson(doc, postData);
-                
-                request->send(200, "application/json", postData);
-            });
-            
-            server.on("/exec", HTTP_POST,
-                [](AsyncWebServerRequest *request) { },
-                NULL,
-                [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-                    JsonDocument doc;
-                    DeserializationError error = deserializeJson(doc, data);
-                    
-                    if (error) {
-                        request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
-                        return;
-                    }
-                    
-                    JsonArray commands = doc["commands"];
-                    
-                    for (const char* cmd : commands) {
-                        Serial.println(cmd);
-                        the_mesh.handleCommand(cmd);
-                    }
-                    
-                    request->send(200, "application/json", "{}");
-                }
-            );
-            
-            ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
-                (void)len;
-                
-                if (type == WS_EVT_CONNECT) {
-                    if (the_mesh.dbg) Serial.println("ws connect");
-                    client->setCloseClientOnQueueFull(false);
-                    client->ping();
-                } else if (type == WS_EVT_DISCONNECT) {
-                    if (the_mesh.dbg) Serial.println("ws disconnect");
-                } else if (type == WS_EVT_ERROR) {
-                    if (the_mesh.dbg) Serial.println("ws error");
-                } else if (type == WS_EVT_PONG) {
-                    if (the_mesh.dbg) Serial.println("ws pong");
-                } else if (type == WS_EVT_DATA) {
-                    if (the_mesh.dbg) Serial.println("ws data");
-                }
-            });
-            
-            // shows how to prevent a third WS client to connect
-            server.addHandler(&ws);
-            
-            server.begin();
-            #endif
+            arr.add(obj);
         }
         
-        void setup() {
-            Serial.begin(115200);
-            delay(1000);
+        String postData;
+        serializeJson(doc, postData);
+        
+        request->send(200, "application/json", postData);
+    });
+    
+    server.on("/telemetry.json", HTTP_GET, [](AsyncWebServerRequest *request) {
+        JsonDocument doc;
+        JsonArray arr = doc["telemetry"].to<JsonArray>();
+        
+        const TelemetryRules* tel = the_mesh.getTelemetryRules();
+        
+        for (int i=0; i<tel->rules.size(); i++) {
+            JsonDocument obj;
+            obj["id"] = i;
             
-            board.begin();
+            TelemetryRule* rule = tel->rules[i];
+            ContactInfo* c = the_mesh.lookupContactByPubKey(rule->pubkey, rule->key_len);
             
-            if (!radio_init()) { halt(); }
+            String tmp = "";
+            for (int j=0;j<rule->key_len && j < PUB_KEY_SIZE;j++) {
+                if (j > 0) tmp += ':';
+                if (rule->pubkey[j] < 0x10) tmp += '0';
+                tmp += String(rule->pubkey[j], HEX);
+            }
+            obj["pk"] = tmp;
             
-            fast_rng.begin(radio_get_rng_seed());
+            tmp = "";
+            if (rule->path_len == -1) {
+                tmp = "Flood";
+            } else {
+                for (int j=0;j<rule->path_len && j<MAX_PATH_SIZE;j++) {
+                    if (j > 0) tmp += ',';
+                    if (rule->path[j] < 0x10) tmp += '0';
+                    tmp += String(rule->path[j], HEX);
+                }
+            }
+            obj["path"] = tmp;
+            obj["password"] = rule->password;
+            obj["start"] = rule->start;
+            obj["interval"] = rule->interval;
+            obj["next"] = rule->next;
+            obj["loggedin"] = rule->loggedin;
             
-            SPIFFS.begin(true);
-            the_mesh.begin(SPIFFS);
-            
-            radio_set_params(the_mesh.getFreqPref(), LORA_BW, LORA_SF, LORA_CR);
-            radio_set_tx_power(the_mesh.getTxPowerPref());
-            
-            the_mesh.showWelcome();
-            
-            int core = xPortGetCoreID() == 1 ? 0 : 1;
-            startMeshTask(0);
-            startWifiTask(1);
+            if (c) {
+                obj["name"] = c->name;
+            } else {
+                obj["name"] = "unknown";
+            }
+            arr.add(obj);
         }
         
-        void loop() {}
+        String postData;
+        serializeJson(doc, postData);
         
+        request->send(200, "application/json", postData);
+    });
+    
+    server.on("/exec", HTTP_POST,
+        [](AsyncWebServerRequest *request) { },
+        NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            JsonDocument doc;
+            DeserializationError error = deserializeJson(doc, data);
+            
+            if (error) {
+                request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+                return;
+            }
+            
+            JsonArray commands = doc["commands"];
+            
+            for (const char* cmd : commands) {
+                Serial.println(cmd);
+                the_mesh.handleCommand(cmd);
+            }
+            
+            request->send(200, "application/json", "{}");
+        }
+    );
+    
+    ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+        (void)len;
+        
+        if (type == WS_EVT_CONNECT) {
+            if (the_mesh.dbg) Serial.println("ws connect");
+            client->setCloseClientOnQueueFull(false);
+            client->ping();
+        } else if (type == WS_EVT_DISCONNECT) {
+            if (the_mesh.dbg) Serial.println("ws disconnect");
+        } else if (type == WS_EVT_ERROR) {
+            if (the_mesh.dbg) Serial.println("ws error");
+        } else if (type == WS_EVT_PONG) {
+            if (the_mesh.dbg) Serial.println("ws pong");
+        } else if (type == WS_EVT_DATA) {
+            if (the_mesh.dbg) Serial.println("ws data");
+        }
+    });
+    
+    // shows how to prevent a third WS client to connect
+    server.addHandler(&ws);
+    
+    server.begin();
+    #endif
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    
+    board.begin();
+    
+    if (!radio_init()) { halt(); }
+    
+    fast_rng.begin(radio_get_rng_seed());
+    
+    SPIFFS.begin(true);
+    the_mesh.begin(SPIFFS);
+    
+    radio_set_params(the_mesh.getFreqPref(), LORA_BW, LORA_SF, LORA_CR);
+    radio_set_tx_power(the_mesh.getTxPowerPref());
+    
+    the_mesh.showWelcome();
+    
+    int core = xPortGetCoreID() == 1 ? 0 : 1;
+    startMeshTask(0);
+    startWifiTask(1);
+    
+    constexpr uint32_t watchdog_timeout_s = 15;
+#if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR >= 5
+    esp_task_wdt_config_t watchdog_config = {};
+    watchdog_config.timeout_ms = watchdog_timeout_s * 1000;
+    watchdog_config.idle_core_mask = (1U << portNUM_PROCESSORS) - 1;
+    watchdog_config.trigger_panic = true;
+    esp_task_wdt_reconfigure(&watchdog_config);
+#else
+    if (esp_task_wdt_init(watchdog_timeout_s, true) == ESP_ERR_INVALID_STATE) {
+        esp_task_wdt_deinit();
+        esp_task_wdt_init(watchdog_timeout_s, true);
+    }
+#endif
+}
+
+void loop() {
+    vTaskDelay(1);
+}
