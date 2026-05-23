@@ -81,6 +81,7 @@ void logSystem(String tag="SYS") {
     doc["sys"]["version"]["logger"] = LOGGER_VER_TEXT;
     doc["sys"]["version"]["meshcore"] = FIRMWARE_VER_TEXT;
     doc["sys"]["version"]["date"] = BUILD_DATE;
+    doc["sys"]["version"]["board"] = board.getManufacturerName();
     // stats
     doc["sys"]["stats"]["tx"]["packets"] = the_mesh.stats.tx.packets;
     doc["sys"]["stats"]["tx"]["packets_total"] = the_mesh.stats.tx.packets_total;
