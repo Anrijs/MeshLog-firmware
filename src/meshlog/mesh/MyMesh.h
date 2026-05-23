@@ -379,7 +379,6 @@ public:
         }
 
     void setClock(uint32_t timestamp, bool ntp) {
-        static bool clockSynced = false;
         uint32_t curr = getRTCClock()->getCurrentTime();
         if (timestamp > curr || ntp) {
             getRTCClock()->setCurrentTime(timestamp);
@@ -390,11 +389,6 @@ public:
                 // update local
             } else {
                 ntpSynced = true;
-            }
-            if (!clockSynced) {
-                // send out initial Advertisement to the mesh
-                sendSelfAdvert(1200);   // add slight delay
-                clockSynced = true;
             }
             Serial.println("   (OK - clock set!)");
         } else {
