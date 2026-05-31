@@ -208,11 +208,11 @@ void WiFiTaskCode(void * pvParameters) {
                 }
             }
             
-            #ifdef WEBSERVER_ENABLED
+            #ifdef WEBSERVER_ENABLE
             if (webserver) {
                 ws.cleanupClients(5); 
             } else if (!webserver && the_mesh.getLogPrefs()->web) {
-                if (dbg) Serial.println("Start webserver");
+                if (the_mesh.dbg) Serial.println("Start webserver");
                 setupWebserver();
                 webserver = true;
             }
