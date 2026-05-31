@@ -1634,6 +1634,7 @@ public:
                 }
 
                 Serial.printf("  WiFi Status: %s (%u)\n", status.c_str(), wstatus);
+                Serial.print( "  WiFi IP:     "); Serial.println(WiFi.localIP());
                 Serial.printf("  WiFi Config:\n");
                 Serial.printf("    Version:   %u\n", _wifi.version);
                 Serial.printf("    SSID:      %s\n", _wifi.ssid);
