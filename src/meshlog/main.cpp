@@ -148,38 +148,37 @@ void WiFiTaskCode(void * pvParameters) {
                 the_mesh.stats.reset();
             }
             
-            if (messageQueue.size() > 0) {
+            String msg;
+            size_t queued = 0;
+            if (messageQueue.peek(msg, &queued)) {
                 String auth = "Bearer ";
                 auth += the_mesh.getLogPrefs()->auth;
-                
-                String msg = messageQueue.front();
-                if (!msg.isEmpty()) {
-                    if (the_mesh.debugPrint()) {
-                        if (the_mesh.dbg) Serial.printf("Queue peek %s\n", msg.c_str());
-                    }
-                    
-                    if (memcmp(the_mesh.getLogPrefs()->url, "http", 4) != 0) {
-                        if (the_mesh.dbg) Serial.println("Url not set.");
-                        messageQueue.pop();
-                    }
-                    
+
+                if (the_mesh.debugPrint()) {
+                    if (the_mesh.dbg) Serial.printf("Queue peek %s\n", msg.c_str());
+                }
+
+                if (memcmp(the_mesh.getLogPrefs()->url, "http", 4) != 0) {
+                    if (the_mesh.dbg) Serial.println("Url not set.");
+                    messageQueue.pop();
+                } else {
                     // WiFi send
                     HTTPClient https;
                     bool sent = false;
-                    
-                    if (the_mesh.dbg) Serial.printf("[HTTP] Send packet: %u bytes (%u rem.)\n", msg.length(), messageQueue.size());
+
+                    if (the_mesh.dbg) Serial.printf("[HTTP] Send packet: %u bytes (%u rem.)\n", msg.length(), queued);
                     if (https.begin(*client, the_mesh.getLogPrefs()->url)) { // HTTPS connection
                         https.addHeader("Content-Type", "application/json");
-                        
+
                         if (auth.length() > 7) {
                             https.addHeader("Authorization", auth);
                         }
-                        
+
                         if (the_mesh.debugPrint()) {
                             if (the_mesh.dbg) Serial.println("[HTTP] Post data");
                         }
                         int httpResponseCode = https.POST(msg);
-                        
+
                         if (httpResponseCode > 0) {
                             String response = https.getString();
                             if (the_mesh.dbg) Serial.printf("[HTTP] POST: %d | %s\n", httpResponseCode, response.c_str());
@@ -188,14 +187,14 @@ void WiFiTaskCode(void * pvParameters) {
                             if (the_mesh.dbg) Serial.printf("[HTTP] ERROR: %d\n", httpResponseCode);
                             ++sendFailures;
                         }
-                        
+
                         messageQueue.pop();
                         https.end();
                     } else {
                         ++sendFailures;
                         if (the_mesh.dbg) Serial.println("[HTTP] Unable to connect");
                     }
-                    
+
                     if (sent) {
                         unsigned bef = ESP.getFreeHeap();
                         sendFailures = 0;
@@ -249,7 +248,7 @@ void WiFiTaskCode(void * pvParameters) {
             lastConencted = millis();
         }
         
-        task_sleep(10);
+        task_sleep(25);
     }
 }
 

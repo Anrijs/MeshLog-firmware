@@ -54,14 +54,26 @@ struct {
           Serial.printf("Discarded message (%u) %s\n", discarded, queue.front().c_str());
       queue.pop();
     }
-      queue.push(str);
+      queue.emplace(str);
+      xSemaphoreGive(mutex);
+  }
+
+  void push(String&& str) {
+      xSemaphoreTake(mutex, portMAX_DELAY);
+      while (queue.size() >= MAX_LOG_QUEUE_SIZE) {
+          discarded++;
+          Serial.printf("Discarded message (%u) %s\n", discarded, queue.front().c_str());
+          queue.pop();
+      }
+      queue.emplace(std::move(str));
       xSemaphoreGive(mutex);
   }
 
   void push(const JsonDocument& doc) {
     String postData;
+      postData.reserve(measureJson(doc) + 1);
     serializeJson(doc, postData);
-    push(postData);
+      push(std::move(postData));
   }
 
   size_t size() { 
@@ -70,12 +82,23 @@ struct {
     xSemaphoreGive(mutex);
     return s;
   }
-  String front() {
+
+  bool peek(String& out, size_t* queued = nullptr) {
     xSemaphoreTake(mutex, portMAX_DELAY);
-    String val = queue.empty() ? String() : queue.front();
+      size_t count = queue.size();
+      if (queued) {
+          *queued = count;
+      }
+      if (count == 0) {
     xSemaphoreGive(mutex);
-    return val;
+          return false;
+      }
+
+      out = queue.front();
+      xSemaphoreGive(mutex);
+      return true;
   }
+
   void pop() {
     xSemaphoreTake(mutex, portMAX_DELAY);
     if (!queue.empty()) {
