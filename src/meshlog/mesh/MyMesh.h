@@ -606,45 +606,43 @@ protected:
 
     void reportRaw(mesh::Packet* pkt) {
         // log raw
-        if (_logp.doraw) {
-            int phType = (pkt->header >> PH_TYPE_SHIFT) & PH_TYPE_MASK;
+        int phType = (pkt->header >> PH_TYPE_SHIFT) & PH_TYPE_MASK;
 
-            if (debugPrint()) {
-                Serial.println("[RAW] Received packet:");
-                Serial.printf("      header:          %u\n", pkt->header);
-                Serial.printf("        route-type:    %u\n", pkt->header & PH_ROUTE_MASK); // 2 bits
-                Serial.printf("        payload-type:  %s (%u)\n", type2str(phType), phType); // 4 bits
-                Serial.printf("        payload-vers:  %u\n", (pkt->header >> PH_VER_SHIFT) & PH_VER_MASK); // 2 bits
-                Serial.printf("      payload_len:     %u\n", pkt->payload_len);
-                Serial.printf("      path_len:        %u\n", pkt->path_len);
-                Serial.printf("      transport_codes: %u %u\n", pkt->transport_codes[0], pkt->transport_codes[1]);
-                Serial.printf("      snr:             %i\n", pkt->_snr);
-                Serial.println();
-            }
-
-            uint8_t hash[MAX_HASH_SIZE];
-            pkt->calculatePacketHash(hash);
-
-            uint8_t rawData[256];
-            uint8_t rawSize = pkt->writeTo(rawData);
-
-            char sender[(PUB_KEY_SIZE * 2) + 1];
-            char strdata[(rawSize * 2) + 1];
-            char strhash[MAX_HASH_SIZE * 2 + 1];
-
-            mesh::Utils::toHex(sender, self_id.pub_key, PUB_KEY_SIZE);
-            mesh::Utils::toHex(strdata, rawData, rawSize);
-            mesh::Utils::toHex(strhash, hash, MAX_HASH_SIZE);
-
-            JsonDocument doc;
-            doc["version"] = MESHLOG_VERSION;
-            doc["type"] = "RAW";
-            doc["reporter"] = sender;
-            doc["time"]["local"] = getRTCClock()->getCurrentTime();
-            doc["packet"]["raw"] = strdata;
-            doc["packet"]["snr"] = pkt->getSNR();
-            messageQueue.push(doc);
+        if (debugPrint()) {
+            Serial.println("[RAW] Received packet:");
+            Serial.printf("      header:          %u\n", pkt->header);
+            Serial.printf("        route-type:    %u\n", pkt->header & PH_ROUTE_MASK); // 2 bits
+            Serial.printf("        payload-type:  %s (%u)\n", type2str(phType), phType); // 4 bits
+            Serial.printf("        payload-vers:  %u\n", (pkt->header >> PH_VER_SHIFT) & PH_VER_MASK); // 2 bits
+            Serial.printf("      payload_len:     %u\n", pkt->payload_len);
+            Serial.printf("      path_len:        %u\n", pkt->path_len);
+            Serial.printf("      transport_codes: %u %u\n", pkt->transport_codes[0], pkt->transport_codes[1]);
+            Serial.printf("      snr:             %i\n", pkt->_snr);
+            Serial.println();
         }
+
+        uint8_t hash[MAX_HASH_SIZE];
+        pkt->calculatePacketHash(hash);
+
+        uint8_t rawData[256];
+        uint8_t rawSize = pkt->writeTo(rawData);
+
+        char sender[(PUB_KEY_SIZE * 2) + 1];
+        char strdata[(rawSize * 2) + 1];
+        char strhash[MAX_HASH_SIZE * 2 + 1];
+
+        mesh::Utils::toHex(sender, self_id.pub_key, PUB_KEY_SIZE);
+        mesh::Utils::toHex(strdata, rawData, rawSize);
+        mesh::Utils::toHex(strhash, hash, MAX_HASH_SIZE);
+
+        JsonDocument doc;
+        doc["version"] = MESHLOG_VERSION;
+        doc["type"] = "RAW";
+        doc["reporter"] = sender;
+        doc["time"]["local"] = getRTCClock()->getCurrentTime();
+        doc["packet"]["raw"] = strdata;
+        doc["packet"]["snr"] = pkt->getSNR();
+        messageQueue.push(doc);
     }
 
     mesh::DispatcherAction onRecvPacket(mesh::Packet* pkt) override {
@@ -1812,14 +1810,6 @@ public:
                 }
                 saveLogPrefs();
                 Serial.println("  OK");
-            } else if (memcmp(config, "raw ", 4) == 0) {
-                if (config[4] == 'y') {
-                _logp.doraw = 1;
-                } else {
-                _logp.doraw = 0;
-                }
-                saveLogPrefs();
-                Serial.println("  OK");
             } else if (memcmp(config, "usbraw ", 7) == 0) {
                 if (config[7] == 'y') {
                 _logp.usbraw = 1;
@@ -1856,7 +1846,6 @@ public:
                 Serial.printf("  Log url:     %s\n", _logp.url);
                 Serial.printf("  Self-report: %u\n", _logp.selfreport);
                 Serial.printf("  Pub Key:     %s\n", sender);
-                Serial.printf("  Raw:         %u\n", _logp.doraw);
                 Serial.printf("  Fwd:         %u\n", _logp.dofwd);
                 Serial.printf("  Web:         %u\n", _logp.web);
                 Serial.printf("  USB Raw      %u\n", _logp.usbraw);

@@ -46,7 +46,7 @@ struct LogPrefs {
     uint32_t selfreport;
     char auth[32];
     char url[256];
-    uint8_t doraw;
+    uint8_t _unused_doraw;
     uint8_t dofwd;
     uint8_t web;
     uint8_t usbraw;
