@@ -440,8 +440,6 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
     }
 
 public:
-    bool dbg = false;
-
     struct {
         long last = 0;
         struct {
@@ -945,7 +943,7 @@ protected:
         for (int i=0;i<inlen-3;i++) {
             if (text[i] == ':' && text[i+2] == '/') {
                 start = i + 2;
-                if (dbg) Serial.printf("Start at %u -> %c\n", start, text[start]);
+                if (debugPrint()) Serial.printf("Start at %u -> %c\n", start, text[start]);
                 break;
             }
         }
@@ -978,7 +976,7 @@ protected:
             data = data.substring(npos + llen); // remove recipient name
         }
 
-        if (dbg) {
+        if (debugPrint()) {
             Serial.print("Bot Command:\n");
             Serial.printf("  reply:        %u\n", reply);
             Serial.printf("  hasRecipient: %u\n", hasRecipient);
@@ -1017,8 +1015,8 @@ protected:
         }
 
         if (rep.length() > 0) {
-            if (dbg) Serial.print("CMD Reply: ");
-            if (dbg) Serial.println(rep);
+            if (debugPrint()) Serial.print("CMD Reply: ");
+            if (debugPrint()) Serial.println(rep);
             uint8_t temp[5+MAX_TEXT_LEN+32];
             uint32_t otimestamp = getRTCClock()->getCurrentTime();
             memcpy(temp, &otimestamp, 4);
@@ -1043,7 +1041,7 @@ protected:
         uint32_t tag;
         memcpy(&tag, data, 4);
 
-        if (dbg) Serial.printf("onContactResponse: %08X - %02X\n", tag, data[4]);
+        if (debugPrint()) Serial.printf("onContactResponse: %08X - %02X\n", tag, data[4]);
         if (pending_login && memcmp(&pending_login, contact.id.pub_key, 4) == 0) {
             // response to pending sendLogin()
             pending_login = 0;
@@ -1052,7 +1050,7 @@ protected:
                 pending_telemetry_next = millis() + 500;
                 pending_telemetry = 1;
                 telemetry_eta = millis() - telemetry_eta;
-                if (dbg) Serial.printf("Login OK, took %u ms\n", telemetry_eta);
+                if (debugPrint()) Serial.printf("Login OK, took %u ms\n", telemetry_eta);
                 if (curr_telemetry_rule) curr_telemetry_rule->loggedin = true;
                 rawDecoded = true;
             }
@@ -1081,14 +1079,14 @@ protected:
             JsonArray telemetryRoot = doc["telemetry"].to<JsonArray>();
 
             //decode(uint8_t *buffer, uint8_t size, JsonArray &root);
-            if (dbg) Serial.println("decode telemetry");
+            if (debugPrint()) Serial.println("decode telemetry");
             telemetry.decode((uint8_t*) &data[4], len - 4, telemetryRoot);
             messageQueue.push(doc);
             rawDecoded = true;
 
             String output;
             serializeJson(doc, output);
-            if (dbg) Serial.println(output);
+            if (debugPrint()) Serial.println(output);
 
             String msgData;
             JsonDocument doc2;
@@ -1104,7 +1102,7 @@ protected:
 
     void telemetryRun(int id, bool login=true, bool schedule=false) {
         if (id >= _telemetry.rules.size()) {
-            if (dbg) Serial.println("  ERROR: Bad ID");
+            if (debugPrint()) Serial.println("  ERROR: Bad ID");
             return;
         }
 
@@ -1115,7 +1113,7 @@ protected:
         }
 
         if (curr_telemetry && !schedule) {
-            if (dbg) Serial.println("  ERROR: Already running");
+            if (debugPrint()) Serial.println("  ERROR: Already running");
             return;
         }
 
@@ -1123,7 +1121,7 @@ protected:
         curr_telemetry = lookupContactByPubKey(curr_telemetry_rule->pubkey, curr_telemetry_rule->key_len);
 
         if (!curr_telemetry) {
-            if (dbg) Serial.println("  ERROR: Contact not found");
+            if (debugPrint()) Serial.println("  ERROR: Contact not found");
             return;
         }
 
@@ -1150,7 +1148,7 @@ protected:
         if (curr_telemetry && pending_telemetry_retries >= _telemetry.retries) {
             if (pending_telemetry_next < millis()) {
                 curr_telemetry_rule->loggedin = false; // unset logged in flag.
-                if (dbg) Serial.printf("Telemetry to %s timed out\n", curr_telemetry->name);
+                if (debugPrint()) Serial.printf("Telemetry to %s timed out\n", curr_telemetry->name);
 
                 String msgData;
                 JsonDocument doc2;
@@ -1182,7 +1180,7 @@ protected:
                 telemetry_eta = millis();
                 uint32_t est_timeout;
                 int result = sendLogin(*curr_telemetry, curr_telemetry_rule->password, est_timeout);
-                if (dbg) Serial.printf("Telemetry login %s, result=%u, to=%u | %u/%u\n",
+                if (debugPrint()) Serial.printf("Telemetry login %s, result=%u, to=%u | %u/%u\n",
                     curr_telemetry->name,
                     result,
                     est_timeout,
@@ -1199,7 +1197,7 @@ protected:
                 delay(1000);
                 uint32_t tag, est_timeout;
                 int result = sendRequest(*curr_telemetry, REQ_TYPE_GET_TELEMETRY_DATA, tag, est_timeout);
-                if (dbg) Serial.printf("Telemetry read %s, tag=%08X, result=%um to=%u | %u/%u\n",
+                if (debugPrint()) Serial.printf("Telemetry read %s, tag=%08X, result=%um to=%u | %u/%u\n",
                     curr_telemetry->name,
                     tag,
                     result,
@@ -1235,7 +1233,7 @@ protected:
                     }
                 } else if (rule->next < now) {
                     rule->next = now + rule->interval;
-                    if (dbg) Serial.printf("Schedule %u\n", pos);
+                    if (debugPrint()) Serial.printf("Schedule %u\n", pos);
                     telemetryRun(pos);
                     break;
                 }
@@ -1254,7 +1252,7 @@ protected:
     }
 
     void onSendTimeout() override {
-        if (dbg) Serial.println("   ERROR: timed out, no ACK.");
+        if (debugPrint()) Serial.println("   ERROR: timed out, no ACK.");
     }
 
 public:
@@ -2167,10 +2165,6 @@ public:
                     }
                 }
             }
-        } else if (memcmp(command, "dbg", 3) == 0) {
-            dbg = !dbg;
-            Serial.print("  Debug ");
-            Serial.println(dbg ? "ON" : "OFF");
         } else if (memcmp(command, "help", 4) == 0) {
             Serial.println("Commands:");
             Serial.println("   set {name|lat|lon|freq|tx|af} {value}");

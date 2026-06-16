@@ -155,18 +155,18 @@ void WiFiTaskCode(void * pvParameters) {
                 auth += the_mesh.getLogPrefs()->auth;
 
                 if (the_mesh.debugPrint()) {
-                    if (the_mesh.dbg) Serial.printf("Queue peek %s\n", msg.c_str());
+                    if (the_mesh.debugPrint()) Serial.printf("Queue peek %s\n", msg.c_str());
                 }
 
                 if (memcmp(the_mesh.getLogPrefs()->url, "http", 4) != 0) {
-                    if (the_mesh.dbg) Serial.println("Url not set.");
+                    if (the_mesh.debugPrint()) Serial.println("Url not set.");
                     messageQueue.pop();
                 } else {
                     // WiFi send
                     HTTPClient https;
                     bool sent = false;
 
-                    if (the_mesh.dbg) Serial.printf("[HTTP] Send packet: %u bytes (%u rem.)\n", msg.length(), queued);
+                    if (the_mesh.debugPrint()) Serial.printf("[HTTP] Send packet: %u bytes (%u rem.)\n", msg.length(), queued);
                     if (https.begin(*client, the_mesh.getLogPrefs()->url)) { // HTTPS connection
                         https.addHeader("Content-Type", "application/json");
 
@@ -175,16 +175,16 @@ void WiFiTaskCode(void * pvParameters) {
                         }
 
                         if (the_mesh.debugPrint()) {
-                            if (the_mesh.dbg) Serial.println("[HTTP] Post data");
+                            if (the_mesh.debugPrint()) Serial.println("[HTTP] Post data");
                         }
                         int httpResponseCode = https.POST(msg);
 
                         if (httpResponseCode > 0) {
                             String response = https.getString();
-                            if (the_mesh.dbg) Serial.printf("[HTTP] POST: %d | %s\n", httpResponseCode, response.c_str());
+                            if (the_mesh.debugPrint()) Serial.printf("[HTTP] POST: %d | %s\n", httpResponseCode, response.c_str());
                             sent = true;
                         } else {
-                            if (the_mesh.dbg) Serial.printf("[HTTP] ERROR: %d\n", httpResponseCode);
+                            if (the_mesh.debugPrint()) Serial.printf("[HTTP] ERROR: %d\n", httpResponseCode);
                             ++sendFailures;
                         }
 
@@ -192,7 +192,7 @@ void WiFiTaskCode(void * pvParameters) {
                         https.end();
                     } else {
                         ++sendFailures;
-                        if (the_mesh.dbg) Serial.println("[HTTP] Unable to connect");
+                        if (the_mesh.debugPrint()) Serial.println("[HTTP] Unable to connect");
                     }
 
                     if (sent) {
@@ -201,7 +201,7 @@ void WiFiTaskCode(void * pvParameters) {
                         reported = true;
                         unsigned aft = ESP.getFreeHeap();
                         if (the_mesh.debugPrint()) {
-                            if (the_mesh.dbg) Serial.printf("free mem: %u -> %u >> %d\n",bef,aft,bef-aft);
+                            if (the_mesh.debugPrint()) Serial.printf("free mem: %u -> %u >> %d\n",bef,aft,bef-aft);
                         }
                     }
                 }
@@ -211,7 +211,7 @@ void WiFiTaskCode(void * pvParameters) {
             if (webserver) {
                 ws.cleanupClients(5); 
             } else if (!webserver && the_mesh.getLogPrefs()->web) {
-                if (the_mesh.dbg) Serial.println("Start webserver");
+                if (the_mesh.debugPrint()) Serial.println("Start webserver");
                 setupWebserver();
                 webserver = true;
             }
@@ -226,7 +226,7 @@ void WiFiTaskCode(void * pvParameters) {
             char sender[(PUB_KEY_SIZE * 2) + 1];
             mesh::Utils::toHex(sender, the_mesh.getPubKey(), PUB_KEY_SIZE);
             
-            if (the_mesh.dbg) Serial.println("Reconenct wifi...");
+            if (the_mesh.debugPrint()) Serial.println("Reconenct wifi...");
             
             // if WiFi is down, try reconnecting
             if (!sendsys) {
@@ -451,17 +451,17 @@ void setupWebserver() {
         (void)len;
         
         if (type == WS_EVT_CONNECT) {
-            if (the_mesh.dbg) Serial.println("ws connect");
+            if (the_mesh.debugPrint()) Serial.println("ws connect");
             client->setCloseClientOnQueueFull(false);
             client->ping();
         } else if (type == WS_EVT_DISCONNECT) {
-            if (the_mesh.dbg) Serial.println("ws disconnect");
+            if (the_mesh.debugPrint()) Serial.println("ws disconnect");
         } else if (type == WS_EVT_ERROR) {
-            if (the_mesh.dbg) Serial.println("ws error");
+            if (the_mesh.debugPrint()) Serial.println("ws error");
         } else if (type == WS_EVT_PONG) {
-            if (the_mesh.dbg) Serial.println("ws pong");
+            if (the_mesh.debugPrint()) Serial.println("ws pong");
         } else if (type == WS_EVT_DATA) {
-            if (the_mesh.dbg) Serial.println("ws data");
+            if (the_mesh.debugPrint()) Serial.println("ws data");
         }
     });
     
