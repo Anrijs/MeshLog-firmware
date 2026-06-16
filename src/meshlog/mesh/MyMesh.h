@@ -4,6 +4,7 @@
 #include <Mesh.h>
 
 #include <queue>
+#include <utility>
 #include <SPIFFS.h>
 #include <RTClib.h>
 #include <target.h>
@@ -23,6 +24,7 @@
 #define TELEMETRY_DEFAULT_RETRIES 3
 #define TELEMETRY_RETRY_INTERVAL 30000 //ms
 #define TELEMETRY_MIN_INTERVAL 10800 // 3 hours
+#define CONTACTS_SAVE_INTERVAL_MILLIS (6UL * 60UL * 60UL * 1000UL)
 
 #define MAX_LOG_QUEUE_SIZE  32
 
@@ -116,6 +118,98 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
     // pkt decoded?
     bool rawDecoded = false;
     bool ntpSynced = false;
+    unsigned long contactsNextSave = 0;
+    bool contactsDirty = false;
+
+    bool isTelemetryProtectedContact(const ContactInfo& contact) const {
+        for (TelemetryRule* rule : _telemetry.rules) {
+            if (rule->key_len > 0 && memcmp(contact.id.pub_key, rule->pubkey, rule->key_len) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool shouldMakeSpaceForNewContact(mesh::Packet* pkt, const uint8_t* app_data, size_t app_data_len) {
+        if (getNumContacts() < MAX_CONTACTS) {
+            return false;
+        }
+
+        AdvertDataParser parser(app_data, app_data_len);
+        if (!(parser.isValid() && parser.hasName())) {
+            return false;
+        }
+
+        if (!shouldAutoAddContactType(parser.getType())) {
+            return false;
+        }
+
+        uint8_t max_hops = getAutoAddMaxHops();
+        if (max_hops > 0 && pkt->getPathHashCount() >= max_hops) {
+            return false;
+        }
+
+        return true;
+    }
+
+    bool evictOldestNonTelemetryContact() {
+        ContactsIterator iter;
+        ContactInfo c;
+        ContactInfo oldest = {};
+        bool found = false;
+
+        while (iter.hasNext(this, c)) {
+            if (isTelemetryProtectedContact(c)) {
+                continue;
+            }
+
+            if (!found || c.last_advert_timestamp < oldest.last_advert_timestamp) {
+                oldest = c;
+                found = true;
+            }
+        }
+
+        if (!found) {
+            return false;
+        }
+
+        if (curr_recipient && curr_recipient->id.matches(oldest.id)) {
+            curr_recipient = nullptr;
+        }
+        if (curr_telemetry && curr_telemetry->id.matches(oldest.id)) {
+            curr_telemetry = nullptr;
+        }
+
+        if (!removeContact(oldest)) {
+            return false;
+        }
+
+        char key[16];
+        int key_pos = 0;
+        for (int i = 0; i < 4; i++) {
+            key_pos += snprintf(&key[key_pos], sizeof(key) - key_pos, "%02X:", oldest.id.pub_key[i]);
+        }
+        snprintf(&key[key_pos], sizeof(key) - key_pos, "..");
+        Serial.printf("Evicted contact: %s (%s)\n", oldest.name, key);
+        return true;
+    }
+
+    void scheduleContactsSave() {
+        contactsDirty = true;
+        if (contactsNextSave == 0) {
+            contactsNextSave = futureMillis(CONTACTS_SAVE_INTERVAL_MILLIS);
+        }
+    }
+
+    void flushScheduledContactsSave() {
+        if (!contactsDirty || contactsNextSave == 0 || !millisHasNowPassed(contactsNextSave)) {
+            return;
+        }
+
+        saveContacts();
+        contactsDirty = false;
+        contactsNextSave = 0;
+    }
 
     void loadContacts() {
         if (_fs->exists("/contacts")) {
@@ -599,6 +693,9 @@ protected:
     void onAdvertRecv(mesh::Packet* pkt, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len) {
         ContactInfo* from = lookupContactByPubKey(id.pub_key, PUB_KEY_SIZE);
         bool is_new = from == NULL;
+        if (is_new && shouldMakeSpaceForNewContact(pkt, app_data, app_data_len)) {
+            evictOldestNonTelemetryContact();
+        }
         BaseChatMesh::onAdvertRecv(pkt, id, timestamp, app_data, app_data_len);  // chain to super impl
         from = lookupContactByPubKey(id.pub_key, PUB_KEY_SIZE);
 
@@ -621,7 +718,7 @@ protected:
     }
 
     void onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t* path) override {
-        saveContacts();
+        scheduleContactsSave();
     }
 
     String getPath(mesh::Packet* pkt) {
@@ -658,7 +755,7 @@ protected:
             Serial.printf("%02X", contact.out_path[i]);
         }
         Serial.println();
-        saveContacts();
+        scheduleContactsSave();
     }
 
     ContactInfo* processAck(const uint8_t *data) override {
@@ -2092,6 +2189,7 @@ public:
         BaseChatMesh::loop();
         getRTCClock()->tick();
         telemetryLoop();
+        flushScheduledContactsSave();
 
         int len = strlen(command);
         while (Serial.available() && len < sizeof(command)-1) {
