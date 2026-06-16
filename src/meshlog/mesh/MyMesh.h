@@ -1805,6 +1805,7 @@ public:
                 saveLogPrefs();
                 Serial.println("  OK");
             } else if (memcmp(config, "web ", 4) == 0) {
+#ifdef WEBSERVER_ENABLE
                 if (config[4] == 'y' || config[4] == '1') {
                 Serial.println("Website enabled");
                 _logp.web = 1;
@@ -1812,9 +1813,11 @@ public:
                 Serial.println("Website disabled");
                 _logp.web = 0;
                 }
-                Serial.println("Reboot to apply");
                 saveLogPrefs();
-                Serial.println("  OK");
+                Serial.println("Reboot to apply");
+#else
+                Serial.println("Webserver not enabled in this build.");
+#endif
             } else {
                 char sender[(PUB_KEY_SIZE * 2) + 1];
                 mesh::Utils::toHex(sender, self_id.pub_key, PUB_KEY_SIZE);
