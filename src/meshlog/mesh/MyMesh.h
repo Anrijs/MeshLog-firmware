@@ -962,7 +962,11 @@ protected:
             Serial.printf("  cmd:          %s\n", cmd.c_str());
         }
 
+#ifdef DEFAULT_BOT
+        if (!reply && hasRecipient) return;
+#else
         if (!reply) return;
+#endif
 
         if (cmd == "/echo") {
             data.trim();
