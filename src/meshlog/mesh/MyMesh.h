@@ -1869,20 +1869,15 @@ public:
             const char* action = &command[4];
             if (memcmp(action, "ls", 2) == 0) {
                 uint32_t now = getRTCClock()->getCurrentTime();
-                Serial.println("ID | Name                 | Pub Key        | Path          | Start | Interval | Next     | L | Password");
+                Serial.println("ID | Name                 | Pub Key        | Path           | Start | Interval | Next     | L | Password");
                 for (int i=0; i<_telemetry.rules.size(); i++) {
                     TelemetryRule* rule = _telemetry.rules[i];
-
-                    // id
-                    Serial.printf("%2d | ", i);
-
-                    // name
+                    char uname[32] = "_unknown_";
                     ContactInfo* c = lookupContactByPubKey(rule->pubkey, rule->key_len);
                     if (c) {
-                        char uname[32];
                         int k = 0;
+                        uname[0] = 0;
                         for (int j=0;j<32;j++) {
-                            uname[k] = 0;
                             char b = c->name[j];
                             if (b == 0) {
                                 break;
@@ -1890,51 +1885,61 @@ public:
                                 uname[k++] = b;
                             }
                         }
-                        Serial.printf("%-20.20s | ", uname);
-                    } else {
-                        Serial.print("_unknown_ | ");
+                        uname[k] = 0;
                     }
 
-                    // key
+                    char key[16];
+                    int key_pos = 0;
                     for (int j=0;j<4;j++) {
                         if (j < rule->key_len) {
-                            Serial.printf("%02X:", rule->pubkey[j]);
+                            key_pos += snprintf(&key[key_pos], sizeof(key) - key_pos, "%02X:", rule->pubkey[j]);
                         } else {
-                            Serial.print("--:");
+                            key_pos += snprintf(&key[key_pos], sizeof(key) - key_pos, "--:");
                         }
                     }
-                    Serial.print(".. | ");
+                    snprintf(&key[key_pos], sizeof(key) - key_pos, "..");
 
-                    // path
+                    char path[16];
                     if (rule->path_len == -1) {
-                        Serial.print("Flood         | ");
+                        snprintf(path, sizeof(path), "Flood");
                     } else {
+                        int path_pos = 0;
                         for (int j = 0; j < 4; j++) {
-                            if (j > 0) Serial.print(j < rule->path_len ? ',' : ' ');
-                            if (j < rule->path_len)
-                                Serial.printf("%02X", rule->path[j]);
-                            else
-                                Serial.print("  ");
+                            if (j > 0) {
+                                path[path_pos++] = j < rule->path_len ? ',' : ' ';
+                            }
+                            if (j < rule->path_len) {
+                                path_pos += snprintf(&path[path_pos], sizeof(path) - path_pos, "%02X", rule->path[j]);
+                            } else {
+                                path[path_pos++] = ' ';
+                                path[path_pos++] = ' ';
+                            }
                         }
 
                         if (rule->path_len == 5) {
-                            Serial.printf(",%02X", rule->path[4]);
+                            snprintf(&path[path_pos], sizeof(path) - path_pos, ",%02X", rule->path[4]);
                         } else if (rule->path_len > 5) {
-                            Serial.print(".. | ");
+                            snprintf(&path[path_pos], sizeof(path) - path_pos, "..");
                         } else {
-                            Serial.print("   | ");
+                            snprintf(&path[path_pos], sizeof(path) - path_pos, "   ");
                         }
                     }
 
-                    // timing
                     uint32_t eta =  rule->next - now;
-                    Serial.printf("%-5d | %-8d | %-8d | %c | %s\n",
-                        rule->start,
-                        rule->interval,
-                        eta,
+                    char line[128];
+                    snprintf(line, sizeof(line), "%2d | %-20.20s | %-14s | %-14s | %-5u | %-8u | %-8u | %c | %s",
+                        i,
+                        uname,
+                        key,
+                        path,
+                        (unsigned)rule->start,
+                        (unsigned)rule->interval,
+                        (unsigned)eta,
                         rule->loggedin ? 'Y' : 'n',
                         rule->password
                     );
+                    Serial.println(line);
+                    Serial.flush();
                 }
             } else if (memcmp(action, "run ", 4) == 0) {
                 const char* idstr = &action[4];
@@ -2078,42 +2083,41 @@ public:
                 ContactInfo c;
                 int i = 0;
 
-                uint32_t curr = getRTCClock()->getCurrentTime();
-
-                Serial.println("ID | Name                s | Pub Key        | Type | Last mod");
+                Serial.println("ID | Name                 | Pub Key        | Type | Last mod");
                 while (iter.hasNext(this, c)) {
-                Serial.printf("%2d | ", i);
-                i++;
-
-                Serial.printf("%-20.20s | ", c.name);
-
+                    char key[16];
+                    int key_pos = 0;
                 for (int j=0;j<4;j++) {
-                    Serial.printf("%02X:", c.id.pub_key[j]);
+                        key_pos += snprintf(&key[key_pos], sizeof(key) - key_pos, "%02X:", c.id.pub_key[j]);
                 }
+                    snprintf(&key[key_pos], sizeof(key) - key_pos, "..");
 
-                Serial.print(".. | ");
-
+                    const char* type = "unkn";
                 if (c.type == ADV_TYPE_NONE) {
-                    Serial.print("None");
+                        type = "None";
                 } else if (c.type == ADV_TYPE_CHAT) {
-                    Serial.print("Chat");
+                        type = "Chat";
                 } else if (c.type == ADV_TYPE_REPEATER) {
-                    Serial.print("Rept");
+                        type = "Rept";
                 } else if (c.type == ADV_TYPE_ROOM) {
-                    Serial.print("Room");
+                        type = "Room";
                 } else if (c.type == ADV_TYPE_SENSOR) {
-                    Serial.print("Sens");
-                } else {
-                    Serial.print("unkn");
+                        type = "Sens";
                 }
 
-                Serial.print(" | ");
+                    int32_t secs = c.lastmod;
 
-                char tmp[40];
-                int32_t secs = c.lastmod;;
-                AdvertTimeHelper::formatRelativeTimeDiff(tmp, secs, false);
-                Serial.println(secs);
-
+                    char line[96];
+                    snprintf(line, sizeof(line), "%2d | %-20.20s | %-14s | %-4s | %ld",
+                        i,
+                        c.name,
+                        key,
+                        type,
+                        (long)secs
+                    );
+                    Serial.println(line);
+                    Serial.flush();
+                    i++;
                 }
             } else if (memcmp(action, "rm", 2) == 0) {
                 const char* idstr = &action[3];
